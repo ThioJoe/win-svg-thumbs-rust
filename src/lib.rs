@@ -399,8 +399,8 @@ impl std::ops::DerefMut for VariantGuard {
     }
 }
 
-/// Parses CSS text content and returns a list of class names and their concatenated style properties.
-fn parse_css_rules(css_content: &str) -> Vec<(String, String)> {
+/// Parses CSS text content and returns a HashMap of selectors to their concatenated style properties.
+fn parse_css_rules(css_content: &str) -> HashMap<String, String> {
     // Helper to find the matching closing brace, aware of strings and nested braces.
     // `s` is the full string, `start_pos` is the byte index of the opening brace '{'.
     // Returns the byte index of the matching '}'.
@@ -507,8 +507,7 @@ fn parse_css_rules(css_content: &str) -> Vec<(String, String)> {
         }
     }
     
-    // Convert the map to the Vec format expected by the caller.
-    style_map.into_iter().collect()
+    style_map
 }
 
 /// Removes CSS comments from the input string.
@@ -655,84 +654,54 @@ fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
     if has_css {
         let style_map = parse_css_rules(&combined_css);
 
-        // ------------------- LOCAL FUNCTION -------------------
-        /// Checks if a string is a valid, simple CSS identifier safe for XPath.
-        /// This uses an allowlist approach, which is more secure than a blocklist.
-        /// It permits only alphanumeric characters, hyphens, and underscores,
-        /// which covers the vast majority of real-world class and tag names.
-        fn is_valid_css_identifier(s: &str) -> bool {
-            if s.is_empty() {
-                return false;
-            }
-
-            // Check the first character. According to CSS spec, it can't be a digit or a hyphen followed by a digit.
-            // We can be even stricter for security.
-            let mut chars = s.chars();
-            if let Some(first) = chars.next() {
-                // A simple, strict rule: must start with a letter or underscore.
-                if !(first.is_alphabetic() || first == '_') {
-                    return false;
-                }
-            }
-
-            // Check the rest of the characters.
-            for c in chars {
-                if !(c.is_alphanumeric() || c == '-' || c == '_') {
-                    return false; // Reject anything else.
-                }
-            }
-
-            true // If all checks pass, the identifier is considered safe.
-        }
-        // -------------------------------------------------------
-
         let bstr_style = BSTR::from("style");
+        let bstr_class = BSTR::from("class");
 
-        for (selector, properties_to_apply) in &style_map {
-            let xpath_query = if let Some(class_name) = selector.strip_prefix('.') {
-                // Sanitize class name using a strict allowlist.
-                if !is_valid_css_identifier(class_name) {
-                    continue; // Skip invalid/malicious class names.
-                }
-                format!("//*[contains(concat(' ', normalize-space(@class), ' '), ' {} ')]", class_name)
-            } else {
-                // Sanitize tag name using a strict allowlist.
-                if !is_valid_css_identifier(selector) {
-                    continue; // Skip invalid/malicious tag names.
-                }
-                format!("//*[local-name()='{}']", selector)
-            };
+        // Single-pass approach: traverse the DOM once and use O(1) HashMap lookups
+        // to apply styles, instead of running an XPath query per CSS rule.
+        let all_elements: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from("//*"))? };
+        for i in 0..unsafe { all_elements.length()? } {
+            if let Ok(element) = unsafe { all_elements.get_item(i)?.cast::<IXMLDOMElement>() } {
+                let mut new_styles = String::new();
 
-            let tagged_nodes: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from(xpath_query))? };
-            for i in 0..unsafe { tagged_nodes.length()? } {
-                if let Ok(node) = unsafe { tagged_nodes.get_item(i) } {
-                    // A node could be a comment, text, etc. We only care about elements, so we try to cast it.
-                    // `cast` is a safe way to perform `QueryInterface` in `windows-rs`.
-                    if let Ok(element) = node.cast::<IXMLDOMElement>() {
-                        let mut existing_style = String::new();
-                        // Check if the element *already* has an inline `style="..."` attribute.
-                        if let Ok(style_variant_raw) = unsafe { element.getAttribute(&bstr_style) } {
-                            let style_variant = VariantGuard(style_variant_raw);
-                            if let Ok(Some(style_string)) = style_variant.try_as_string() {
-                                existing_style = style_string;
-                                // To preserve existing styles, we need to append them. Ensure there's a semicolon separator.
-                                if !existing_style.is_empty() && !existing_style.ends_with(';') {
-                                    existing_style.push(';');
-                                }
+                // 1. Check tag name (e.g., "path", "rect") for matching CSS rules.
+                if let Ok(tag_name) = unsafe { element.nodeName() } {
+                    let tag_str = tag_name.to_string();
+                    // local-name matching: strip any namespace prefix.
+                    let local_name = tag_str.rsplit_once(':').map_or(tag_str.as_str(), |(_, l)| l);
+                    if let Some(css) = style_map.get(local_name) {
+                        new_styles.push_str(css);
+                    }
+                }
+
+                // 2. Check class names (e.g., ".st0") for matching CSS rules.
+                if let Ok(class_attr_raw) = unsafe { element.getAttribute(&bstr_class) } {
+                    if let Ok(Some(classes)) = VariantGuard(class_attr_raw).try_as_string() {
+                        for class_name in classes.split_whitespace() {
+                            let key = format!(".{}", class_name);
+                            if let Some(css) = style_map.get(&key) {
+                                new_styles.push_str(css);
                             }
                         }
-
-                        // Combine the new styles from the CSS rule with any pre-existing inline styles.
-                        // We prepend our new styles so that existing inline styles can override them if needed, which is standard CSS behavior.
-                        let final_style = format!("{}{}", properties_to_apply, existing_style);
-
-                        // SAFER APPROACH: Create the BSTR and convert it to a VARIANT safely using `From`.
-                        // This sets VT_BSTR and transfers ownership without manual unsafe manipulation.
-                        let variant_value = VariantGuard(VARIANT::from(BSTR::from(final_style)));
-
-                        // Finally, set the 'style' attribute on the element with our new, combined style string.
-                        let _ = unsafe { element.setAttribute(&bstr_style, &variant_value) };
                     }
+                }
+
+                // If we found matching CSS rules, combine with any existing inline style and apply.
+                if !new_styles.is_empty() {
+                    let mut existing_style = String::new();
+                    if let Ok(style_variant_raw) = unsafe { element.getAttribute(&bstr_style) } {
+                        if let Ok(Some(style_string)) = VariantGuard(style_variant_raw).try_as_string() {
+                            existing_style = style_string;
+                            if !existing_style.is_empty() && !existing_style.ends_with(';') {
+                                existing_style.push(';');
+                            }
+                        }
+                    }
+
+                    // Prepend CSS rules so existing inline styles take precedence (standard CSS behavior).
+                    let final_style = format!("{}{}", new_styles, existing_style);
+                    let variant_value = VariantGuard(VARIANT::from(BSTR::from(final_style)));
+                    let _ = unsafe { element.setAttribute(&bstr_style, &variant_value) };
                 }
             }
         }
