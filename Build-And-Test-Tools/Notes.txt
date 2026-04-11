@@ -1,0 +1,4 @@
+You can disable thumbnail caching in file explorer via group policy editor:
+
+- User Configuration > Administrative Templates > Windows Components > File Explorer > "Turn off caching of thumbnail pictures"
+- User Configuration > Administrative Templates > Windows Components > File Explorer > "Turn off caching of thumbnails in hidden thumbs.db files"
