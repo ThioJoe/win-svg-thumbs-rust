@@ -1019,10 +1019,14 @@ impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_I
                         debug_log!("Initialize: Warning - Could not get stream size, will read with safety checks");
                     }
 
-                    // Do not trust the reported size for allocation.
-                    // Start with a default-sized Vec and let it grow.
+                    // Pre-allocate buffer if we got a valid stream size, otherwise let it grow.
                     let seq_stream: Com::ISequentialStream = stream.cast()?;
-                    let mut buffer: Vec<u8> = Vec::new();
+                    let capacity = if statstg.cbSize > 0 && statstg.cbSize <= MAX_SIZE {
+                        statstg.cbSize as usize
+                    } else {
+                        0
+                    };
+                    let mut buffer: Vec<u8> = Vec::with_capacity(capacity);
                     let mut chunk: Vec<u8> = vec![0u8; 65536];
                     
                     loop {
