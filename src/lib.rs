@@ -27,7 +27,6 @@ use windows::{
             self,
             Direct2D::{
                 *, 
-                self, 
                 Common::*
             },
             Direct3D,
@@ -838,47 +837,8 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
             unsafe { d2d_context.DrawSvgDocument(&svg_doc) };
         } // EndDraw called here by guard
         
-        // Clear target before applying effects
+        // Clear target after drawing
         unsafe { d2d_context.SetTarget(None) };
-        
-        // Apply UnPremultiply effect
-        let final_bitmap: ID2D1Bitmap1;
-        match unsafe { d2d_context.CreateEffect(&Direct2D::CLSID_D2D1UnPremultiply) } {
-            Ok(unpremultiply_effect) => {
-                // Create a second render target bitmap for the UnPremultiply effect output
-                let output_bitmap: ID2D1Bitmap1 = unsafe { d2d_context.CreateBitmap(D2D_SIZE_U { width: requested_width, height: requested_height }, None, 0, &bitmap_props_rt) }?;
-                
-                // Switch to the output bitmap as the target and begin a new draw session
-                unsafe { d2d_context.SetTarget(&output_bitmap) };
-                {
-                    let _effect_draw_guard = D2D1DrawGuard::new(&d2d_context);
-                    
-                    // SetInput doesn't return a Result, it's a void method
-                    unsafe { unpremultiply_effect.SetInput(0, &render_target_bitmap, true) };
-                    
-                    match unpremultiply_effect.cast::<ID2D1Image>() {
-                        Ok(effect_image) => {
-                            // DrawImage doesn't return a Result either
-                            unsafe { d2d_context.DrawImage(&effect_image, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_COPY) };
-                        }
-                        Err(_) => {
-                            // Effect cast failed, but we'll still return the output bitmap
-                            // The draw guard will clean up properly
-                        }
-                    }
-                } // EndDraw called here by guard
-                
-                // Clear target after effect drawing
-                unsafe { d2d_context.SetTarget(None) };
-                
-                // Return the output bitmap from the UnPremultiply effect
-                final_bitmap = output_bitmap
-            }
-            Err(_) => {
-                // Fall back to original bitmap if effect creation fails
-                final_bitmap = render_target_bitmap
-            }
-        };
 
         // 4. Create the CPU-readable STAGING bitmap
         let bitmap_props_staging = D2D1_BITMAP_PROPERTIES1 {
@@ -892,7 +852,7 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
         
         // 5. Copy from render target to staging bitmap (GPU -> CPU accessible D2D memory)
         // This copies the pixel data but it's still in D2D's memory space
-        unsafe { staging_bitmap.CopyFromBitmap(None, &final_bitmap, None) }?;
+        unsafe { staging_bitmap.CopyFromBitmap(None, &render_target_bitmap, None) }?;
         
         // 6. Map the staging bitmap to get a pointer to the pixel data using RAII guard
         let (map_guard, mapped_rect) = BitmapMapGuard::new(&staging_bitmap)?;
@@ -935,23 +895,30 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
             // PRE-INITIALIZE the destination buffer to zero. This is the simplest way to prevent garbage data in any padding bytes left over from a stride mismatch.
             dest_data.fill(0);
 
-            // Now, copy the image data.
-            if mapped_rect.pitch == (requested_width * 4) {
-                // Direct copy if stride matches.
-                dest_data.copy_from_slice(&source_data[..dest_data.len()]);
-            } else {
-                // Copy row by row to handle stride differences.
-                let dest_stride: usize = (requested_width * 4) as usize;
-                let source_stride: usize = mapped_rect.pitch as usize;
-                let row_copy_len = std::cmp::min(dest_stride, source_stride);
+            // Copy pixels from source to dest, un-premultiplying alpha on the CPU.
+            // This replaces the previous GPU-based D2D UnPremultiply effect.
+            let dest_stride: usize = (requested_width * 4) as usize;
+            let source_stride: usize = mapped_rect.pitch as usize;
 
-                for y in 0..requested_height as usize {
-                    let src_start: usize = y * source_stride;
-                    let dest_start: usize = y * dest_stride;
-                    
-                    let src_slice = &source_data[src_start .. src_start + row_copy_len];
-                    let dest_slice = &mut dest_data[dest_start .. dest_start + row_copy_len];
-                    dest_slice.copy_from_slice(src_slice);
+            for y in 0..requested_height as usize {
+                let src_start: usize = y * source_stride;
+                let dest_start: usize = y * dest_stride;
+
+                let src_slice = &source_data[src_start .. src_start + dest_stride];
+                let dest_slice = &mut dest_data[dest_start .. dest_start + dest_stride];
+
+                // Copy pixels and un-premultiply simultaneously
+                for i in (0..dest_stride).step_by(4) {
+                    let a = src_slice[i + 3] as u32;
+                    if a == 0 || a == 255 {
+                        dest_slice[i..i+4].copy_from_slice(&src_slice[i..i+4]);
+                    } else {
+                        // Un-premultiply: Color = (Premultiplied * 255) / Alpha
+                        dest_slice[i]   = ((src_slice[i] as u32 * 255) / a) as u8;   // B
+                        dest_slice[i+1] = ((src_slice[i+1] as u32 * 255) / a) as u8; // G
+                        dest_slice[i+2] = ((src_slice[i+2] as u32 * 255) / a) as u8; // R
+                        dest_slice[i+3] = a as u8;                                   // A
+                    }
                 }
             }
         }
