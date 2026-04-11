@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     cell::RefCell,
     collections::HashMap,
     ffi::OsStr,
@@ -554,50 +553,47 @@ fn normalize_css_properties(properties: &str) -> String {
     result
 }
 
-/// Extracts CSS content from all <style> tags within an SVG using the MSXML parser.
-/// Returns both the CSS rules and the cleaned SVG data with !important stripped.
-fn extract_css_from_svg_data(svg_data: &[u8]) -> Result<(String, Cow<'_, [u8]>)> {
-    // log_message(&format!("extract_css_from_svg_data: Processing {} bytes of SVG data", svg_data.len()));
-    
-    // MSXML is a COM library, so COM must be initialized on the current thread.
-    let _com_guard = ComGuard::new()?;
-
-    // First, do a quick check on the entire SVG data to see if !important exists anywhere, to know whether further processing is needed for that
+/// Processes an uncompressed SVG in a single MSXML DOM pass:
+/// 1. Extracts CSS from <style> tags
+/// 2. Strips !important from both <style> content and inline style attributes
+/// 3. Parses extracted CSS into rules and applies them as inline styles on matching elements
+/// 4. Serializes the modified DOM back to bytes exactly once
+///
+/// Returns the processed SVG data ready for Direct2D rendering.
+fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
+    // First, do a quick check on the entire SVG data to see if !important exists anywhere, to know whether further processing is needed for that.
     // If so we'll want to remove !important from inline styles as well, because apparently Direct2D won't render any attributes with it.
     let svg_string = String::from_utf8_lossy(svg_data);
     let found_important = svg_string.contains("!important");
-    
-    // if found_important {
-    //     log_message("extract_css_from_svg_data: Found !important declarations in SVG, will clean them");
-    // }
 
-    // log_message("extract_css_from_svg_data: Creating MSXML DOM parser");
+    // MSXML is a COM library, so COM must be initialized on the current thread.
+    let _com_guard = ComGuard::new()?;
 
     // Create an instance of the MSXML6 DOM Document object.
     let dom: MsXml::IXMLDOMDocument2 = unsafe { Com::CoCreateInstance(&DOMDocument60, None, Com::CLSCTX_INPROC_SERVER)? };
-    
+
     // Load the SVG data from an in-memory stream.
     let stream: Com::IStream = unsafe { Shell::SHCreateMemStream(Some(svg_data)) }
-        .ok_or_else(|| Error::new(E_FAIL, "Failed to create memory stream for CSS extraction"))?;
-    
+        .ok_or_else(|| Error::new(E_FAIL, "Failed to create memory stream for SVG processing"))?;
+
     let stream_unknown: IUnknown = stream.cast()?;
     let stream_variant = VariantGuard(VARIANT::from(stream_unknown));
 
     // The MSXML parser will read the SVG data directly from our in-memory stream.
     let success = unsafe { dom.load(&stream_variant)? };
     if success != VARIANT_TRUE {
-        log_message("extract_css_from_svg_data: MSXML failed to parse SVG, returning no CSS");
-        // If loading fails, it might not be a valid XML/SVG. The original string-based parser was also lenient.
-        // Instead of failing the entire render, we'll treat this as "no CSS found" and return the original data.
-        return Ok((String::new(), Cow::Borrowed(svg_data)));
+        log_message("process_svg_styles: MSXML failed to parse SVG, returning original data");
+        // If loading fails, it might not be a valid XML/SVG. Instead of failing the entire render,
+        // we'll treat this as "no processing needed" and return the original data.
+        return Ok(svg_data.to_vec());
     }
 
-    // log_message("extract_css_from_svg_data: Successfully parsed SVG, extracting <style> elements");
+    // --- Phase 1: Extract CSS from <style> elements ---
 
     // Use a namespace-agnostic XPath query to find all <style> elements. This is necessary because
     // most SVGs define a default namespace (xmlns="..."), which would cause a simple "//style" query to fail.
     let style_nodes: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from("//*[local-name()='style']"))? };
-    
+
     let mut combined_css = String::new();
     for i in 0..unsafe { style_nodes.length()? } {
         if let Ok(node) = unsafe { style_nodes.get_item(i) } {
@@ -605,201 +601,157 @@ fn extract_css_from_svg_data(svg_data: &[u8]) -> Result<(String, Cow<'_, [u8]>)>
             // For a <style> element, this is exactly the CSS code inside it.
             if let Ok(css_bstr) = unsafe { node.text() } {
                 let css_text = css_bstr.to_string();
-                // Strip "!important" declarations from CSS content only - not needed for SVGs and can cause rendering issues
+                // Strip "!important" declarations from CSS content - not needed for SVGs and can cause rendering issues
                 let cleaned_css = css_text.replace("!important", "");
-                
+
                 // Update the original node with the cleaned CSS to prevent issues during SVG processing
                 if cleaned_css != css_text {
-                    log_message("extract_css_from_svg_data: Cleaned !important from <style> element");
+                    log_message("process_svg_styles: Cleaned !important from <style> element");
                     let _ = unsafe { node.Settext(&BSTR::from(cleaned_css.clone())) };
                 }
-                
+
                 combined_css.push_str(&cleaned_css);
                 combined_css.push('\n'); // Add a newline for separation.
             }
         }
     }
-    
-    // log_message(&format!("extract_css_from_svg_data: Extracted {} bytes of CSS from <style> elements", combined_css.len()));
-    
+
+    // --- Phase 2: Strip !important from inline style attributes ---
+
     // If we found !important anywhere in the SVG, also check for it in inline style attributes.
     // This is an expensive operation, so we only do it when we see !important anywhere in the data.
-    let svg_data_to_return = if found_important {
-        // log_message("extract_css_from_svg_data: Processing inline style attributes to remove !important");
-        strip_important_from_inline_styles(&dom)?;
-        let modified_xml_bstr = unsafe { dom.xml()? };
-        Cow::Owned(modified_xml_bstr.to_string().into_bytes())
-    } else {
-        Cow::Borrowed(svg_data) // No copy when unchanged!
-    };
-    
-    Ok((combined_css, svg_data_to_return))
-}
+    if found_important {
+        let bstr_style = BSTR::from("style");
 
+        // Find all elements that have a style attribute
+        let styled_elements: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from("//*[@style]"))? };
 
-/// If we found "!important" anywhere in the SVG, this will specifically look within elements and attributes to remove it from,
-/// instead of just doing a blanket remove it from all text, in case the SVG has some text that legitimately contains "!important" as part of its content.
-fn strip_important_from_inline_styles(dom: &MsXml::IXMLDOMDocument2) -> Result<()> {
-    let bstr_style = BSTR::from("style");
-    
-    // Find all elements that have a style attribute
-    let styled_elements: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from("//*[@style]"))? };
-    
-    for i in 0..unsafe { styled_elements.length()? } {
-        if let Ok(node) = unsafe { styled_elements.get_item(i) } {
-            if let Ok(element) = node.cast::<IXMLDOMElement>() {
-                if let Ok(style_variant_raw) = unsafe { element.getAttribute(&bstr_style) } {
-                    let style_variant = VariantGuard(style_variant_raw);
-                    if let Ok(Some(raw_style)) = style_variant.try_as_string() {
-                        // Only process if this style attribute contains !important
-                        if raw_style.contains("!important") {
-                            let cleaned_style = raw_style.replace("!important", "");
-                            let variant_value = VariantGuard(VARIANT::from(BSTR::from(cleaned_style)));
-                            
-                            let _ = unsafe { element.setAttribute(&bstr_style, &variant_value) };
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    Ok(())
-}
-
-
-/// Applies inline styles to SVG elements based on their class attributes using the MSXML parser.
-/// It loads the SVG, finds elements by class, applies the provided styles, and returns the modified SVG data.
-fn preprocess_svg_with_msxml(svg_data: &[u8], style_map: &[(String, String)]) -> Result<Vec<u8>> {
-    // log_message(&format!("preprocess_svg_with_msxml: Processing {} bytes of SVG with {} style rules", svg_data.len(), style_map.len()));
-    
-    // Skip it all if there are no styles to apply.
-    if style_map.is_empty() {
-        // log_message("preprocess_svg_with_msxml: No styles to apply, returning original SVG");
-        return Ok(svg_data.to_vec());
-    }
-
-    // MSXML is a COM (Component Object Model) library. Any thread that uses COM must first initialize it.
-    // The `ComGuard` is an RAII wrapper that calls `CoInitializeEx` on creation and `CoUninitialize` on drop, ensuring cleanup.
-    let _com_guard = ComGuard::new()?;
-
-    // This creates an instance of the MSXML6 DOM Document object, which is our XML parser.
-    // `CoCreateInstance` is the standard COM function for creating objects from a CLSID (Class ID).
-    let dom: MsXml::IXMLDOMDocument2 = unsafe { Com::CoCreateInstance(&DOMDocument60, None, Com::CLSCTX_INPROC_SERVER)? };
-    
-    // --- Load SVG data into the DOM document ---
-
-    // `IStream` is a standard COM interface for streamable data, behaving like an in-memory file.
-    let stream: Com::IStream = unsafe { Shell::SHCreateMemStream(Some(svg_data)) }
-        .ok_or_else(|| Error::new(E_FAIL, "Failed to create memory stream for MSXML"))?;
-    
-    // The `dom.load` method requires a `VARIANT`. Convert IStream to IUnknown first, then create VARIANT.
-    // It sets VT_UNKNOWN, handles the conversion to IUnknown, and manages the ownership transfer (ManuallyDrop) internally.
-    // We then immediately wrap the resulting raw VARIANT in our VariantGuard.
-    let stream_unknown: IUnknown = stream.cast()?;
-    let stream_variant = VariantGuard(VARIANT::from(stream_unknown));
-
-    // The MSXML parser will read the SVG data directly from our in-memory stream.
-    let success = unsafe { dom.load(&stream_variant)? };
-    // For `dom.load`, success is specifically indicated by `VARIANT_TRUE` (-1), not just `S_OK` (0).
-    if success != VARIANT_TRUE {
-        return Err(Error::new(E_FAIL, "MSXML failed to load SVG data. It may be malformed."));
-    }
-
-    // --- Find elements matching CSS selectors and apply styles inline ---
-
-    // ------------------- LOCAL FUNCTION -------------------
-    /// Checks if a string is a valid, simple CSS identifier safe for XPath.
-    /// This uses an allowlist approach, which is more secure than a blocklist.
-    /// It permits only alphanumeric characters, hyphens, and underscores,
-    /// which covers the vast majority of real-world class and tag names.
-    fn is_valid_css_identifier(s: &str) -> bool {
-        if s.is_empty() {
-            return false;
-        }
-
-        // Check the first character. According to CSS spec, it can't be a digit or a hyphen followed by a digit.
-        // We can be even stricter for security.
-        let mut chars = s.chars();
-        if let Some(first) = chars.next() {
-            // A simple, strict rule: must start with a letter or underscore.
-            if !(first.is_alphabetic() || first == '_') {
-                return false;
-            }
-        }
-
-        // Check the rest of the characters.
-        for c in chars {
-            if !(c.is_alphanumeric() || c == '-' || c == '_') {
-                return false; // Reject anything else.
-            }
-        }
-
-        true // If all checks pass, the identifier is considered safe.
-    }
-    // -------------------------------------------------------
-
-    let bstr_style = BSTR::from("style");
-
-    for (selector, properties_to_apply) in style_map {
-        let xpath_query = if let Some(class_name) = selector.strip_prefix('.') {
-            // Sanitize class name using a strict allowlist.
-            if !is_valid_css_identifier(class_name) {
-                continue; // Skip invalid/malicious class names.
-            }
-            format!("//*[contains(concat(' ', normalize-space(@class), ' '), ' {} ')]", class_name)
-        } else {
-            // Sanitize tag name using a strict allowlist.
-            if !is_valid_css_identifier(selector) {
-                continue; // Skip invalid/malicious tag names.
-            }
-            format!("//*[local-name()='{}']", selector)
-        };
-
-        let tagged_nodes: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from(xpath_query))? };
-        for i in 0..unsafe { tagged_nodes.length()? } {
-            if let Ok(node) = unsafe { tagged_nodes.get_item(i) } {
-                // A node could be a comment, text, etc. We only care about elements, so we try to cast it.
-                // `cast` is a safe way to perform `QueryInterface` in `windows-rs`.
+        for i in 0..unsafe { styled_elements.length()? } {
+            if let Ok(node) = unsafe { styled_elements.get_item(i) } {
                 if let Ok(element) = node.cast::<IXMLDOMElement>() {
-                    let mut existing_style = String::new();
-                    // Check if the element *already* has an inline `style="..."` attribute.
                     if let Ok(style_variant_raw) = unsafe { element.getAttribute(&bstr_style) } {
                         let style_variant = VariantGuard(style_variant_raw);
-                        if let Ok(Some(style_string)) = style_variant.try_as_string() {
-                            existing_style = style_string;
-                            // To preserve existing styles, we need to append them. Ensure there's a semicolon separator.
-                            if !existing_style.is_empty() && !existing_style.ends_with(';') {
-                                existing_style.push(';');
+                        if let Ok(Some(raw_style)) = style_variant.try_as_string() {
+                            // Only process if this style attribute contains !important
+                            if raw_style.contains("!important") {
+                                let cleaned_style = raw_style.replace("!important", "");
+                                let variant_value = VariantGuard(VARIANT::from(BSTR::from(cleaned_style)));
+
+                                let _ = unsafe { element.setAttribute(&bstr_style, &variant_value) };
                             }
                         }
-                        // We don't need an `else` here. If try_as_bstr returns Err or Ok(None), existing_style remains an empty string, which is correct.
                     }
-
-                    // Combine the new styles from the CSS rule with any pre-existing inline styles.
-                    // We prepend our new styles so that existing inline styles can override them if needed, which is standard CSS behavior.
-                    let final_style = format!("{}{}", properties_to_apply, existing_style);
-                    
-                    // SAFER APPROACH: Create the BSTR and convert it to a VARIANT safely using `From`.
-                    // This sets VT_BSTR and transfers ownership without manual unsafe manipulation.
-                    let variant_value = VariantGuard(VARIANT::from(BSTR::from(final_style)));
-                    
-                    // Finally, set the 'style' attribute on the element with our new, combined style string.
-                    let _ = unsafe { element.setAttribute(&bstr_style, &variant_value) };
                 }
             }
         }
     }
 
-    // After the loop has modified the DOM in memory, serialize the entire document back into a BSTR string.
-    let modified_xml_bstr = unsafe { dom.xml()? };
-    // The `windows::core::BSTR` type is a smart pointer that will auto-free the string.
-    let modified_xml_string = modified_xml_bstr.to_string();
+    // --- Phase 3: Parse CSS rules and apply them as inline styles ---
 
-    log_message(&format!("preprocess_svg_with_msxml: Successfully applied styles, returning {} bytes of modified SVG", modified_xml_string.len()));
+    // If no CSS was found in <style> tags, we may still have modified !important above.
+    // Check if we need to serialize based on whether any modifications were made.
+    let has_css = !combined_css.trim().is_empty();
 
-    // Convert the final string to a byte vector and return it.
-    Ok(modified_xml_string.into_bytes())
+    if has_css {
+        let style_map = parse_css_rules(&combined_css);
+
+        // ------------------- LOCAL FUNCTION -------------------
+        /// Checks if a string is a valid, simple CSS identifier safe for XPath.
+        /// This uses an allowlist approach, which is more secure than a blocklist.
+        /// It permits only alphanumeric characters, hyphens, and underscores,
+        /// which covers the vast majority of real-world class and tag names.
+        fn is_valid_css_identifier(s: &str) -> bool {
+            if s.is_empty() {
+                return false;
+            }
+
+            // Check the first character. According to CSS spec, it can't be a digit or a hyphen followed by a digit.
+            // We can be even stricter for security.
+            let mut chars = s.chars();
+            if let Some(first) = chars.next() {
+                // A simple, strict rule: must start with a letter or underscore.
+                if !(first.is_alphabetic() || first == '_') {
+                    return false;
+                }
+            }
+
+            // Check the rest of the characters.
+            for c in chars {
+                if !(c.is_alphanumeric() || c == '-' || c == '_') {
+                    return false; // Reject anything else.
+                }
+            }
+
+            true // If all checks pass, the identifier is considered safe.
+        }
+        // -------------------------------------------------------
+
+        let bstr_style = BSTR::from("style");
+
+        for (selector, properties_to_apply) in &style_map {
+            let xpath_query = if let Some(class_name) = selector.strip_prefix('.') {
+                // Sanitize class name using a strict allowlist.
+                if !is_valid_css_identifier(class_name) {
+                    continue; // Skip invalid/malicious class names.
+                }
+                format!("//*[contains(concat(' ', normalize-space(@class), ' '), ' {} ')]", class_name)
+            } else {
+                // Sanitize tag name using a strict allowlist.
+                if !is_valid_css_identifier(selector) {
+                    continue; // Skip invalid/malicious tag names.
+                }
+                format!("//*[local-name()='{}']", selector)
+            };
+
+            let tagged_nodes: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from(xpath_query))? };
+            for i in 0..unsafe { tagged_nodes.length()? } {
+                if let Ok(node) = unsafe { tagged_nodes.get_item(i) } {
+                    // A node could be a comment, text, etc. We only care about elements, so we try to cast it.
+                    // `cast` is a safe way to perform `QueryInterface` in `windows-rs`.
+                    if let Ok(element) = node.cast::<IXMLDOMElement>() {
+                        let mut existing_style = String::new();
+                        // Check if the element *already* has an inline `style="..."` attribute.
+                        if let Ok(style_variant_raw) = unsafe { element.getAttribute(&bstr_style) } {
+                            let style_variant = VariantGuard(style_variant_raw);
+                            if let Ok(Some(style_string)) = style_variant.try_as_string() {
+                                existing_style = style_string;
+                                // To preserve existing styles, we need to append them. Ensure there's a semicolon separator.
+                                if !existing_style.is_empty() && !existing_style.ends_with(';') {
+                                    existing_style.push(';');
+                                }
+                            }
+                        }
+
+                        // Combine the new styles from the CSS rule with any pre-existing inline styles.
+                        // We prepend our new styles so that existing inline styles can override them if needed, which is standard CSS behavior.
+                        let final_style = format!("{}{}", properties_to_apply, existing_style);
+
+                        // SAFER APPROACH: Create the BSTR and convert it to a VARIANT safely using `From`.
+                        // This sets VT_BSTR and transfers ownership without manual unsafe manipulation.
+                        let variant_value = VariantGuard(VARIANT::from(BSTR::from(final_style)));
+
+                        // Finally, set the 'style' attribute on the element with our new, combined style string.
+                        let _ = unsafe { element.setAttribute(&bstr_style, &variant_value) };
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Phase 4: Serialize the DOM back to bytes (only once!) ---
+
+    // Only serialize if we actually modified anything (had CSS to apply, or had !important to strip).
+    if has_css || found_important {
+        let modified_xml_bstr = unsafe { dom.xml()? };
+        let modified_xml_string = modified_xml_bstr.to_string();
+
+        log_message(&format!("process_svg_styles: Successfully processed SVG, returning {} bytes", modified_xml_string.len()));
+
+        Ok(modified_xml_string.into_bytes())
+    } else {
+        // Nothing was modified, return original data without serialization overhead.
+        Ok(svg_data.to_vec())
+    }
 }
 
 pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_height: u32) -> Result<Gdi::HBITMAP> {
@@ -846,23 +798,8 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
                 // log_message("render_svg_to_hbitmap: Detected SVGZ (compressed) file, skipping CSS processing");
                 processed_svg_data = svg_data.to_vec();
             } else {
-                // log_message("render_svg_to_hbitmap: Processing uncompressed SVG, extracting CSS");
-                let (css_content, cleaned_svg_data) = extract_css_from_svg_data(svg_data)?;
-
-                // If no CSS is found in <style> tags, skip the expensive CSS parsing and MSXML SVG processing steps.
-                if css_content.trim().is_empty() {
-                    // log_message("render_svg_to_hbitmap: No CSS found in <style> tags, using cleaned SVG");
-                    // No CSS to process, but we might have cleaned !important from inline styles
-                    processed_svg_data = cleaned_svg_data.into_owned();
-                } else {
-                    // log_message(&format!("render_svg_to_hbitmap: Found {} bytes of CSS, processing styles", css_content.len()));
-                    // CSS content was found, so proceed with the full processing pipeline.
-                    let style_map = parse_css_rules(&css_content);
-                    // log_message(&format!("render_svg_to_hbitmap: Parsed {} CSS rules", style_map.len()));
-                    // Preprocess the already-cleaned SVG to inline all CSS styles from the map.
-                    processed_svg_data = preprocess_svg_with_msxml(cleaned_svg_data.as_ref(), &style_map)?;
-                    // log_message("render_svg_to_hbitmap: Successfully applied CSS styles to SVG");
-                }
+                // Single-pass MSXML processing: extracts CSS, strips !important, applies inline styles, serializes once.
+                processed_svg_data = process_svg_styles(svg_data)?;
             }
 
             // log_message("render_svg_to_hbitmap: Creating SVG document from processed data");
