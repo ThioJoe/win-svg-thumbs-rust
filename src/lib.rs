@@ -575,8 +575,7 @@ fn normalize_css_properties(properties: &str) -> String {
 fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
     // First, do a quick check on the entire SVG data to see if !important exists anywhere, to know whether further processing is needed for that.
     // If so we'll want to remove !important from inline styles as well, because apparently Direct2D won't render any attributes with it.
-    let svg_string = String::from_utf8_lossy(svg_data);
-    let found_important = svg_string.contains("!important");
+    let found_important = svg_data.windows(10).any(|window| window == b"!important");
 
     // MSXML is a COM library, so COM must be initialized on the current thread.
     let _com_guard = ComGuard::new()?;
