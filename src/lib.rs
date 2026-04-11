@@ -905,10 +905,9 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
             let dest_data: &mut [u8] = unsafe { 
                 std::slice::from_raw_parts_mut(dib_data.cast::<u8>(), (requested_width * requested_height * 4) as usize) 
             };
-            // PRE-INITIALIZE the destination buffer to zero. This is the simplest way to prevent garbage data in any padding bytes left over from a stride mismatch.
-            dest_data.fill(0);
-
             // Copy pixels from source to dest, un-premultiplying alpha on the CPU.
+            // No pre-initialization needed: the loop below writes every byte of dest_data
+            // (dest stride == width*4, matching the 32-bpp GDI DIB section with no padding).
             // This replaces the previous GPU-based D2D UnPremultiply effect.
             let dest_stride: usize = (requested_width * 4) as usize;
             let source_stride: usize = mapped_rect.pitch as usize;
