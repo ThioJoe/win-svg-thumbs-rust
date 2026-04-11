@@ -14,6 +14,10 @@ build = "build.rs"
 [profile.release]
 # Include debug symbols
 debug = true
+opt-level = 3        # Maximize optimization for speed
+lto = "fat"          # Enable Link Time Optimization (Crucial for auto-vectorizing loops)
+codegen-units = 1    # Slower compile times, but produces significantly faster/smaller binaries
+strip = false        # Automatically strips debugging symbols from the final release binary
 
 [lib]
 crate-type = ["cdylib", "lib"]

@@ -575,7 +575,7 @@ fn normalize_css_properties(properties: &str) -> String {
 fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
     // First, do a quick check on the entire SVG data to see if !important exists anywhere, to know whether further processing is needed for that.
     // If so we'll want to remove !important from inline styles as well, because apparently Direct2D won't render any attributes with it.
-    let found_important = svg_data.windows(10).any(|window| window == b"!important");
+    let found_important = svg_data.windows(10).any(|w| w.eq_ignore_ascii_case(b"!important"));
 
     // MSXML is a COM library, so COM must be initialized on the current thread.
     let _com_guard = ComGuard::new()?;
@@ -925,11 +925,11 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
                     if a == 0 || a == 255 {
                         dest_slice[i..i+4].copy_from_slice(&src_slice[i..i+4]);
                     } else {
-                        // Un-premultiply: Color = (Premultiplied * 255) / Alpha
-                        dest_slice[i]   = ((src_slice[i] as u32 * 255) / a) as u8;   // B
-                        dest_slice[i+1] = ((src_slice[i+1] as u32 * 255) / a) as u8; // G
-                        dest_slice[i+2] = ((src_slice[i+2] as u32 * 255) / a) as u8; // R
-                        dest_slice[i+3] = a as u8;                                   // A
+                        // Un-premultiply: Color = (Premultiplied * 255 + Rounding) / Alpha
+                        dest_slice[i]   = (((src_slice[i] as u32 * 255) + (a / 2)) / a).min(255) as u8;   // B
+                        dest_slice[i+1] = (((src_slice[i+1] as u32 * 255) + (a / 2)) / a).min(255) as u8; // G
+                        dest_slice[i+2] = (((src_slice[i+2] as u32 * 255) + (a / 2)) / a).min(255) as u8; // R
+                        dest_slice[i+3] = a as u8;                                                        // A
                     }
                 }
             }
