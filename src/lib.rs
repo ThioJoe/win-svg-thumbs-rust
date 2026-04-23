@@ -988,8 +988,8 @@ struct ThumbnailProvider {
     svg_data: Mutex<Option<Arc<[u8]>>>,
 }
 
-impl Default for ThumbnailProvider {
-    fn default() -> Self {
+impl ThumbnailProvider {
+    fn new() -> Self {
         dll_add_ref();
         debug_log!("ThumbnailProvider: Created new instance");
         Self {
@@ -1213,8 +1213,8 @@ fn create_fallback_thumbnail(size: u32) -> Result<Gdi::HBITMAP> {
 #[implement(Com::IClassFactory)]
 struct ClassFactory;
 
-impl Default for ClassFactory {
-    fn default() -> Self {
+impl ClassFactory {
+    fn new() -> Self {
         dll_add_ref();
         debug_log!("ClassFactory: Created new instance");
         Self {}
@@ -1249,7 +1249,7 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
             debug_log!("ClassFactory::CreateInstance: Creating ThumbnailProvider instance");
             
             // Create an instance of our ThumbnailProvider
-            let thumbnail_provider: IUnknown = ThumbnailProvider::default().into();
+            let thumbnail_provider: IUnknown = ThumbnailProvider::new().into();
             
             // Query for the interface requested by the caller and return it.
             let hr: HRESULT = unsafe { thumbnail_provider.query(&*riid, ppvobject) };
@@ -1436,7 +1436,7 @@ pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID,
         debug_log!("DllGetClassObject: Creating class factory for SVG Thumbnail Provider");
         
         // Create our class factory.
-        let factory: Com::IClassFactory = ClassFactory::default().into();
+        let factory: Com::IClassFactory = ClassFactory::new().into();
         
         // Query for the interface the caller wants (usually IClassFactory) and return it.
         let hr: HRESULT = unsafe { factory.query(riid, ppv) };
