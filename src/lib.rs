@@ -1409,11 +1409,6 @@ extern "system" fn DllMain(hinst_dll: HMODULE, fdw_reason: u32, _lpv_reserved: *
     ffi_guard!(RESOURCES, BOOL, {
         if fdw_reason == System::SystemServices::DLL_PROCESS_ATTACH {
             MODULE_HANDLE.store(hinst_dll.0 as *mut _, Ordering::Release);
-            // Check registry for hardware acceleration preference once at startup
-            check_hardware_acceleration_registry();
-            // Check registry for debug logging preference once at startup
-            check_debug_logging_registry();
-            
             debug_log!("DllMain: DLL_PROCESS_ATTACH completed. DLL is loaded and initialized.");
         } else if fdw_reason == System::SystemServices::DLL_PROCESS_DETACH {
             debug_log!("DllMain: DLL_PROCESS_DETACH received. DLL is unloading.");
