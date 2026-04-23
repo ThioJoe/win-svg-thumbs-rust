@@ -189,3 +189,7 @@ IF EXIST resources_arm64.res del resources_arm64.res
 
 echo.
 echo Finished updating version info for DLLs.
+
+echo NEXT: If you will be signing the DLLs, do it now before running the MSI Building script.
+
+pause >nul

@@ -29,4 +29,3 @@ wix build win_svg_thumbs.wxs -d ProductVersion="%PRODUCT_VERSION%" -o "SVG-Thumb
 echo.
 echo Build finished. Press any key to exit.
 pause >nul
-
