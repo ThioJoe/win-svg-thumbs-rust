@@ -192,6 +192,10 @@ impl ComGuard {
                 // COM was already initialized by someone else, don't clean up
                 Ok(Self { initialized_by_us: false })
             }
+            RPC_E_CHANGED_MODE => { 
+                // COM was already initialized as MTA on this thread, don't clean up
+                Ok(Self { initialized_by_us: false })
+            }
             _ => {
                 // Real error
                 Err(Error::new(hr, "Failed to initialize COM"))
