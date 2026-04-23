@@ -394,18 +394,24 @@ impl VariantGuard {
         // This entire operation is unsafe because we are manually interpreting a C-style union.
             // Access the variant type tag `vt` directly. It is already a `VARENUM` type, so no casting or construction is needed.
         match unsafe { self.0.Anonymous.Anonymous.vt } {
-                VT_BSTR => {
-                    // It's a BSTR. The `bstrVal` field is valid.
+            VT_BSTR => {
+                // It's a BSTR. The `bstrVal` field is valid.
                 let bstr = unsafe { &self.0.Anonymous.Anonymous.Anonymous.bstrVal };
-                Ok(Some(bstr.to_string()))
-                }
-                VT_EMPTY | VT_NULL => {
-                    // The attribute exists but is empty. This is a valid, non-error state. We represent this as `None`.
+                if bstr.is_empty() {
                     Ok(None)
+                } else {
+                    Ok(Some(bstr.to_string()))
                 }
-                _ => {
-                    // The variant holds a different type (e.g., a number). This is an unexpected state for a 'style' attribute. We return an error to indicate this.
-                    Err(Error::new(E_INVALIDARG, "Variant was not a string type."))
+            }
+
+            VT_EMPTY | VT_NULL => {
+                // The attribute exists but is empty. This is a valid, non-error state. We represent this as `None`.
+                Ok(None)
+            }
+
+            _ => {
+                // The variant holds a different type (e.g., a number). This is an unexpected state for a 'style' attribute. We return an error to indicate this.
+                Err(Error::new(E_INVALIDARG, "Variant was not a string type."))
             }
         }
     }
