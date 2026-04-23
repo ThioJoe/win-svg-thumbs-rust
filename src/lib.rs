@@ -272,8 +272,8 @@ fn get_d2d_resources() -> Result<(ID2D1Factory1, ID2D1Device, ID2D1DeviceContext
                         debug_log!("get_d2d_resources: Hardware acceleration succeeded");
                         d3d_device = device;
                     },
-                    Err(_) => {
-                        debug_log!("get_d2d_resources: Hardware acceleration failed, falling back to WARP");
+                    Err(e) => {
+                        debug_log!("get_d2d_resources: Hardware acceleration failed with error: {:?}, falling back to WARP", e);
                         d3d_device = create_d3d_device(Direct3D::D3D_DRIVER_TYPE_WARP)?;
                     }
                 }
