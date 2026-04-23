@@ -222,9 +222,14 @@ thread_local! {
 fn get_d2d_resources() -> Result<(ID2D1Factory1, ID2D1Device, ID2D1DeviceContext5)> {
     RESOURCES.with(|resources| -> Result<(ID2D1Factory1, ID2D1Device, ID2D1DeviceContext5)> {
         let mut resources_ref = resources.borrow_mut();
+
+        let needs_recreation = match resources_ref.as_ref() {
+            None => true,
+            Some(res) => res.poisoned,
+        };
         
         // If resources are poisoned or don't exist, recreate them
-        if resources_ref.is_none() || resources_ref.as_ref().unwrap().poisoned {
+        if needs_recreation {
             debug_log!("get_d2d_resources: Creating new D2D resources");
             
             // Initialize COM and create all resources
@@ -300,13 +305,20 @@ fn get_d2d_resources() -> Result<(ID2D1Factory1, ID2D1Device, ID2D1DeviceContext
             Ok((d2d_factory, d2d_device, d2d_context))
         } else {
             debug_log!("get_d2d_resources: Reusing existing D2D resources");
-            // Resources exist and are not poisoned, return clones
-            let resources = resources_ref.as_ref().unwrap();
-            Ok((
-                resources.d2d_factory.as_ref().unwrap().clone(),
-                resources.d2d_device.as_ref().unwrap().clone(),
-                resources.d2d_context.as_ref().unwrap().clone(),
-            ))
+            // Resources exist and are not poisoned, cleanly extract and clone them
+            if let Some(resources) = resources_ref.as_ref() {
+                if let (Some(factory), Some(device), Some(context)) = (
+                    &resources.d2d_factory,
+                    &resources.d2d_device,
+                    &resources.d2d_context,
+                ) {
+                    return Ok((factory.clone(), device.clone(), context.clone()));
+                }
+            }
+            
+            // If we somehow get here, our state invariants were violated.
+            // Return an error instead of panicking the host process.
+            Err(Error::new(E_UNEXPECTED, "D2D resources were corrupted or partially initialized"))
         }
     })
 }
