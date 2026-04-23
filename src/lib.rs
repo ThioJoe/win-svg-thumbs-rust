@@ -67,13 +67,13 @@ const WRITE_FLAGS: REG_SAM_FLAGS = KEY_WRITE;
 /// This eliminates the boilerplate code for catch_unwind and error handling.
 macro_rules! ffi_guard {
     // For functions that return Result<T>
-    (Result<$ret_type:ty>, $body:expr) => {{
+    ($tls:ident, Result<$ret_type:ty>, $body:expr) => {{
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                RESOURCES.with(|resources| {
+                $tls.with(|resources| {
                     resources.borrow_mut().take();
                 });
                 //log_message("A PANIC occurred in FFI function.");
@@ -83,12 +83,12 @@ macro_rules! ffi_guard {
     }};
     
     // For functions that return HRESULT directly
-    (HRESULT, $body:expr) => {{
+    ($tls:ident, HRESULT, $body:expr) => {{
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
             Ok(hr) => hr,
             Err(_) => {
-                RESOURCES.with(|resources| {
+                $tls.with(|resources| {
                     resources.borrow_mut().take();
                 });
                 //log_message("A PANIC occurred in FFI function.");
@@ -98,12 +98,12 @@ macro_rules! ffi_guard {
     }};
     
     // For functions that return BOOL
-    (BOOL, $body:expr) => {{
+    ($tls:ident, BOOL, $body:expr) => {{
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
             Ok(success) => success.into(),
             Err(_) => {
-                RESOURCES.with(|resources| {
+                $tls.with(|resources| {
                     resources.borrow_mut().take();
                 });
                 //log_message("A PANIC occurred in FFI function.");
@@ -1009,7 +1009,7 @@ impl Drop for ThumbnailProvider {
 impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_Impl {
     #[allow(non_snake_case)]
     fn Initialize(&self, pstream: Ref<'_, Com::IStream>, _grfmode: u32) -> Result<()> {
-        ffi_guard!(Result<()>, {          
+        ffi_guard!(RESOURCES, Result<()>, {          
             // log_message("Initialize: Starting SVG data loading");
             
             // Guard against repeated initialization calls
@@ -1095,7 +1095,7 @@ impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_I
 impl Shell::IThumbnailProvider_Impl for ThumbnailProvider_Impl {
     #[allow(non_snake_case)]
     fn GetThumbnail(&self, cx: u32, phbmp: *mut Gdi::HBITMAP, pdwalpha: *mut Shell::WTS_ALPHATYPE) -> Result<()> {
-        ffi_guard!(Result<()>, {           
+        ffi_guard!(RESOURCES, Result<()>, {      
             // log_message(&format!("GetThumbnail: Entered with size: {}x{}", cx, cx));
 
             // Initialize output parameters to safe defaults (COM contract requirement)
@@ -1232,7 +1232,7 @@ impl Drop for ClassFactory {
 impl Com::IClassFactory_Impl for ClassFactory_Impl {
     #[allow(non_snake_case)]
     fn CreateInstance(&self, punkouter: Ref<'_, IUnknown>, riid: *const GUID, ppvobject: *mut *mut std::ffi::c_void) -> Result<()> {
-        ffi_guard!(Result<()>, {           
+        ffi_guard!(RESOURCES, Result<()>, {           
             // log_message(&format!("ClassFactory::CreateInstance: Entered. Requesting interface: {:?}", unsafe { *riid }));
 
             // Safety checks for null pointers
@@ -1266,7 +1266,7 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
 
     #[allow(non_snake_case)]
     fn LockServer(&self, flock: BOOL) -> Result<()> {
-        ffi_guard!(Result<()>, {
+        ffi_guard!(RESOURCES, Result<()>, {
             if flock.as_bool() {
                 debug_log!("ClassFactory::LockServer: Locking server (adding reference)");
                 dll_add_ref();
@@ -1396,7 +1396,7 @@ const CLSID_SVG_THUMBNAIL_PROVIDER: GUID = GUID::from_u128(0xa884a812_58fd_47d5_
 #[no_mangle]
 #[allow(non_snake_case)]
 extern "system" fn DllMain(hinst_dll: HMODULE, fdw_reason: u32, _lpv_reserved: *const std::ffi::c_void) -> BOOL {
-    ffi_guard!(BOOL, {
+    ffi_guard!(RESOURCES, BOOL, {
         if fdw_reason == System::SystemServices::DLL_PROCESS_ATTACH {
             MODULE_HANDLE.store(hinst_dll.0 as *mut _, Ordering::Release);
             // Check registry for hardware acceleration preference once at startup
@@ -1415,7 +1415,7 @@ extern "system" fn DllMain(hinst_dll: HMODULE, fdw_reason: u32, _lpv_reserved: *
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut std::ffi::c_void) -> HRESULT {
-    ffi_guard!(HRESULT, {
+    ffi_guard!(RESOURCES, HRESULT, {
         // Check registry settings at entry point in case they changed since DLL load
         check_debug_logging_registry();
         check_hardware_acceleration_registry();
@@ -1460,7 +1460,7 @@ pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID,
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    ffi_guard!(HRESULT, {
+    ffi_guard!(RESOURCES, HRESULT, {
         let ref_count = DLL_REFERENCES.load(Ordering::Acquire);
         
         if ref_count == 0 {
@@ -1681,7 +1681,7 @@ fn delete_registry_keys() -> Result<()> {
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllRegisterServer() -> HRESULT {
-    ffi_guard!(HRESULT, {
+    ffi_guard!(RESOURCES, HRESULT, {
         // log_message("DllRegisterServer: Starting registration");
         match create_registry_keys() {
             Ok(_) => {
@@ -1699,7 +1699,7 @@ pub extern "system" fn DllRegisterServer() -> HRESULT {
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllUnregisterServer() -> HRESULT {
-    ffi_guard!(HRESULT, {
+    ffi_guard!(RESOURCES, HRESULT, {
         // log_message("DllUnregisterServer: Starting unregistration");
         match delete_registry_keys() {
             Ok(_) => {
@@ -1717,7 +1717,7 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
 #[no_mangle]
 // Simple function that only notifies the shell of file association changes.
 pub extern "system" fn notify_shell_change() -> HRESULT {
-    ffi_guard!(HRESULT, {
+    ffi_guard!(RESOURCES, HRESULT, {
         // Notify the shell that file associations have changed
         unsafe { Shell::SHChangeNotify(Shell::SHCNE_ASSOCCHANGED, Shell::SHCNF_IDLIST, None, None) };
         S_OK
