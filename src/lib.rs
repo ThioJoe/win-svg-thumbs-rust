@@ -14,7 +14,8 @@ use std::{
         }, 
         Arc,
         Mutex,
-        OnceLock
+        OnceLock,
+        Once
     },
     path::PathBuf,
 };
@@ -56,8 +57,9 @@ use windows::{
     },
 };
 
-// This is the ONLY definition you need. It works for both 32-bit and 64-bit.
-const WRITE_FLAGS: REG_SAM_FLAGS = KEY_WRITE;
+// Global states and definitions
+const WRITE_FLAGS: REG_SAM_FLAGS = KEY_WRITE; // Works for both 32-bit and 64-bit.
+static INIT_REGISTRY: Once = Once::new(); // Track if registry settings were already loaded
 
 // =================================================================
 //                  FFI Panic Safety Macro
@@ -1421,9 +1423,11 @@ extern "system" fn DllMain(hinst_dll: HMODULE, fdw_reason: u32, _lpv_reserved: *
 #[allow(non_snake_case)]
 pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut std::ffi::c_void) -> HRESULT {
     ffi_guard!(RESOURCES, HRESULT, {
-        // Check registry settings at entry point in case they changed since DLL load
-        check_debug_logging_registry();
-        check_hardware_acceleration_registry();
+        // Guarantee registry reads happen exactly once per process, completely off the loader lock.
+        INIT_REGISTRY.call_once(|| {
+            check_debug_logging_registry();
+            check_hardware_acceleration_registry();
+        });
         
         debug_log!("DllGetClassObject: Entered");
         
