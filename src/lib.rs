@@ -1345,7 +1345,7 @@ fn read_svg_registry_dword(value_name: &str) -> Option<u32> {
         }
     } // Registry key automatically closed here by RegistryKeyGuard
     
-    return None
+    None // Return
 }
 
 // Checks the registry for the hardware acceleration preference.
