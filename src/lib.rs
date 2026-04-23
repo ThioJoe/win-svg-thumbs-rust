@@ -347,28 +347,27 @@ impl<'a> Drop for BitmapMapGuard<'a> {
 // RAII wrapper for D2D BeginDraw/EndDraw - automatically calls EndDraw when dropped
 struct D2D1DrawGuard<'a> {
     context: &'a ID2D1DeviceContext5,
+    ended: bool,
 }
 
 impl<'a> D2D1DrawGuard<'a> {
     fn new(context: &'a ID2D1DeviceContext5) -> Self {
         unsafe { context.BeginDraw() };
-        Self { context }
+        Self { context, ended: false }
+    }
+
+    // Explicitly end drawing and return the result to allow proper error handling
+    fn end(mut self) -> Result<()> {
+        self.ended = true;
+        unsafe { self.context.EndDraw(None, None) }
     }
 }
 
 impl<'a> Drop for D2D1DrawGuard<'a> {
     fn drop(&mut self) {
-        // Check the result of EndDraw. If the device is lost, poison the thread's resources so they will be recreated on the next run.
-        let result = unsafe { self.context.EndDraw(None, None) };
-        if let Err(e) = &result {
-            if e.code() == D2DERR_RECREATE_TARGET {
-                RESOURCES.with(|resources| {
-                    let mut resources_ref = resources.borrow_mut();
-                    if let Some(ref mut res) = *resources_ref {
-                        res.poisoned = true;
-                    }
-                });
-            }
+        // If dropped without explicit end (e.g. via ? operator), ensure we clean up state
+        if !self.ended {
+            let _ = unsafe { self.context.EndDraw(None, None) };
         }
     }
 }
@@ -782,91 +781,93 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
         
         // 3. Set target and draw the SVG
         unsafe { d2d_context.SetTarget(&render_target_bitmap) };
-        {
-            let _draw_guard = D2D1DrawGuard::new(&d2d_context);
-            
-            // Clear to transparent black
-            unsafe { d2d_context.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 })) };
+        
+        let draw_guard = D2D1DrawGuard::new(&d2d_context);
+        
+        // Clear to transparent black
+        unsafe { d2d_context.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 })) };
 
-            // Check for GZIP magic number (0x1F 0x8B) to detect SVGZ files
-            let is_compressed = svg_data.len() >= 2 && svg_data[0] == 0x1F && svg_data[1] == 0x8B;
-               
-            let processed_svg_data: Vec<u8>;
-            // Skip CSS processing for compressed SVGZ files - Direct2D can handle them directly
-            if is_compressed {
-                // log_message("render_svg_to_hbitmap: Detected SVGZ (compressed) file, skipping CSS processing");
-                processed_svg_data = svg_data.to_vec();
-            } else {
-                // Single-pass MSXML processing: extracts CSS, strips !important, applies inline styles, serializes once.
-                processed_svg_data = process_svg_styles(svg_data)?;
+        // Check for GZIP magic number (0x1F 0x8B) to detect SVGZ files
+        let is_compressed = svg_data.len() >= 2 && svg_data[0] == 0x1F && svg_data[1] == 0x8B;
+           
+        let processed_svg_data: Vec<u8>;
+        // Skip CSS processing for compressed SVGZ files - Direct2D can handle them directly
+        if is_compressed {
+            // log_message("render_svg_to_hbitmap: Detected SVGZ (compressed) file, skipping CSS processing");
+            processed_svg_data = svg_data.to_vec();
+        } else {
+            // Single-pass MSXML processing: extracts CSS, strips !important, applies inline styles, serializes once.
+            processed_svg_data = process_svg_styles(svg_data)?;
+        }
+
+        // log_message("render_svg_to_hbitmap: Creating SVG document from processed data");
+        // Load the (potentially processed) svg data into a memory stream.
+        let stream: Com::IStream = unsafe { Shell::SHCreateMemStream(Some(&processed_svg_data)) }.ok_or_else(|| Error::new(E_FAIL, "Failed to create memory stream"))?;
+        
+        // Create the SVG document from the stream of processed SVG data.
+        let svg_doc: ID2D1SvgDocument = unsafe { d2d_context.CreateSvgDocument(
+            &stream,
+            D2D_SIZE_F { 
+                width: requested_width as f32, 
+                height: requested_height as f32
             }
+        ) }?;
 
-            // log_message("render_svg_to_hbitmap: Creating SVG document from processed data");
-            // Load the (potentially processed) svg data into a memory stream.
-            let stream: Com::IStream = unsafe { Shell::SHCreateMemStream(Some(&processed_svg_data)) }.ok_or_else(|| Error::new(E_FAIL, "Failed to create memory stream"))?;
-            
-            // Create the SVG document from the stream of processed SVG data.
-            let svg_doc: ID2D1SvgDocument = unsafe { d2d_context.CreateSvgDocument(
-                &stream,
-                D2D_SIZE_F { 
-                    width: requested_width as f32, 
-                    height: requested_height as f32
-                }
-            ) }?;
+        // Get the root <svg> element from the document, so we can get or change the top level attributes such as width, height, viewbox, etc.
+        if let Ok(root_element) = unsafe { svg_doc.GetRoot() } {
+            // Apparently if there are no width and height attributes, DrawSvgDocument will automatically scale it to the viewbox
+            // So we can just remove them from before drawing, and it will autoscale and fill the thumbnail.
+            //      IMPORTANT: ViewBox is not the same as ViewPort (which is actually just the height/width attributes).
+            // HOWEVER, if there is no viewbox, it could cause issues with scaling. So if there is no viewbox but there are original width and height attributes,
+            //      we can set the viewbox to "0 0 width height" to make it more likely to scale correctly.
+            // Also apparently even though we apparently set the width and height of the viewport when creating the SVG document, it retains the original width and height attributes when using GetAttributeValue3
+            unsafe {
+                // // DEBUG - Maybe useful later: Get the width and height attributes from the root element
+                // let mut width_buffer = [0u16; 32]; // Buffer for width string
+                // let mut height_buffer = [0u16; 32]; // Buffer for height string
+                // let width_result = root_element.GetAttributeValue3(&BSTR::from("width"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut width_buffer);
+                // let height_result = root_element.GetAttributeValue3(&BSTR::from("height"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut height_buffer);
+                // // Print the width and height attributes if they exist
+                // if width_result.is_ok() {
+                //     let width_str = String::from_utf16_lossy(&width_buffer).trim_end_matches('\0').to_string();
+                //     if !width_str.is_empty() { println!("SVG Width: {}", width_str); }
+                // }
+                // if height_result.is_ok() {
+                //     let height_str = String::from_utf16_lossy(&height_buffer).trim_end_matches('\0').to_string();
+                //     if !height_str.is_empty() { println!("SVG Height: {}", height_str); }
+                // }
 
-            // Get the root <svg> element from the document, so we can get or change the top level attributes such as width, height, viewbox, etc.
-            if let Ok(root_element) = unsafe { svg_doc.GetRoot() } {
-                // Apparently if there are no width and height attributes, DrawSvgDocument will automatically scale it to the viewbox
-                // So we can just remove them from before drawing, and it will autoscale and fill the thumbnail.
-                //      IMPORTANT: ViewBox is not the same as ViewPort (which is actually just the height/width attributes).
-                // HOWEVER, if there is no viewbox, it could cause issues with scaling. So if there is no viewbox but there are original width and height attributes,
-                //      we can set the viewbox to "0 0 width height" to make it more likely to scale correctly.
-                // Also apparently even though we apparently set the width and height of the viewport when creating the SVG document, it retains the original width and height attributes when using GetAttributeValue3
-                unsafe {
-                    // // DEBUG - Maybe useful later: Get the width and height attributes from the root element
-                    // let mut width_buffer = [0u16; 32]; // Buffer for width string
-                    // let mut height_buffer = [0u16; 32]; // Buffer for height string
-                    // let width_result = root_element.GetAttributeValue3(&BSTR::from("width"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut width_buffer);
-                    // let height_result = root_element.GetAttributeValue3(&BSTR::from("height"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut height_buffer);
-                    // // Print the width and height attributes if they exist
-                    // if width_result.is_ok() {
-                    //     let width_str = String::from_utf16_lossy(&width_buffer).trim_end_matches('\0').to_string();
-                    //     if !width_str.is_empty() { println!("SVG Width: {}", width_str); }
-                    // }
-                    // if height_result.is_ok() {
-                    //     let height_str = String::from_utf16_lossy(&height_buffer).trim_end_matches('\0').to_string();
-                    //     if !height_str.is_empty() { println!("SVG Height: {}", height_str); }
-                    // }
+                // If there is no viewbox, but there is a width and height, set the viewbox to "0 0 width height" before removing the attributes.
+                let mut viewbox_buffer = [0u16; 64]; // Buffer for viewBox string
+                if root_element.GetAttributeValue3(&BSTR::from("viewBox"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut viewbox_buffer).is_err() {
+                    let mut width_buffer = [0u16; 32]; // Buffer for width string
+                    let mut height_buffer = [0u16; 32]; // Buffer for height string
+                    let width_result = root_element.GetAttributeValue3(&BSTR::from("width"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut width_buffer);
+                    let height_result = root_element.GetAttributeValue3(&BSTR::from("height"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut height_buffer);
 
-                    // If there is no viewbox, but there is a width and height, set the viewbox to "0 0 width height" before removing the attributes.
-                    let mut viewbox_buffer = [0u16; 64]; // Buffer for viewBox string
-                    if root_element.GetAttributeValue3(&BSTR::from("viewBox"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut viewbox_buffer).is_err() {
-                        let mut width_buffer = [0u16; 32]; // Buffer for width string
-                        let mut height_buffer = [0u16; 32]; // Buffer for height string
-                        let width_result = root_element.GetAttributeValue3(&BSTR::from("width"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut width_buffer);
-                        let height_result = root_element.GetAttributeValue3(&BSTR::from("height"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &mut height_buffer);
-
-                        if width_result.is_ok() && height_result.is_ok() {
-                            let width_str = String::from_utf16_lossy(&width_buffer).trim_end_matches('\0').to_string();
-                            let height_str = String::from_utf16_lossy(&height_buffer).trim_end_matches('\0').to_string();
-                            let _ = root_element.SetAttributeValue3(&BSTR::from("viewBox"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(format!("0 0 {} {}", width_str, height_str)));
-                        }
+                    if width_result.is_ok() && height_result.is_ok() {
+                        let width_str = String::from_utf16_lossy(&width_buffer).trim_end_matches('\0').to_string();
+                        let height_str = String::from_utf16_lossy(&height_buffer).trim_end_matches('\0').to_string();
+                        let _ = root_element.SetAttributeValue3(&BSTR::from("viewBox"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(format!("0 0 {} {}", width_str, height_str)));
                     }
-
-                    // Remove width, height and viewBox attributes if they exist
-                    let _ = root_element.RemoveAttribute(w!("height"));
-                    let _ = root_element.RemoveAttribute(w!("width"));
-                    // let _ = root_element.RemoveAttribute(w!("viewBox"));
-                    
-                    // DEBUG - Maybe useful later: How to set height, width and viewBox attributes on the root element
-                    // let _ = root_element.SetAttributeValue3(&BSTR::from("height"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(height.to_string()));
-                    // let _ = root_element.SetAttributeValue3(&BSTR::from("width"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(width.to_string()));
-                    // let _ = root_element.SetAttributeValue3(&BSTR::from("viewBox"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(format!("0 0 {} {}", width, height)));
                 }
+
+                // Remove width, height and viewBox attributes if they exist
+                let _ = root_element.RemoveAttribute(w!("height"));
+                let _ = root_element.RemoveAttribute(w!("width"));
+                // let _ = root_element.RemoveAttribute(w!("viewBox"));
+                
+                // DEBUG - Maybe useful later: How to set height, width and viewBox attributes on the root element
+                // let _ = root_element.SetAttributeValue3(&BSTR::from("height"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(height.to_string()));
+                // let _ = root_element.SetAttributeValue3(&BSTR::from("width"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(width.to_string()));
+                // let _ = root_element.SetAttributeValue3(&BSTR::from("viewBox"), D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG, &BSTR::from(format!("0 0 {} {}", width, height)));
             }
-            
-            unsafe { d2d_context.DrawSvgDocument(&svg_doc) };
-        } // EndDraw called here by guard
+        }
+        
+        unsafe { d2d_context.DrawSvgDocument(&svg_doc) };
+        
+        // Explicitly end the draw batch to bubble up errors (like D2DERR_RECREATE_TARGET)
+        draw_guard.end()?;
         
         // Clear target after drawing
         unsafe { d2d_context.SetTarget(None) };
