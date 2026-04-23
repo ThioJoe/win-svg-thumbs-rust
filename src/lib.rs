@@ -80,7 +80,7 @@ macro_rules! ffi_guard {
                         res.take();
                     }
                 });
-                //log_message("A PANIC occurred in FFI function.");
+                debug_log!("A PANIC occurred in FFI function.");
                 Err(E_FAIL.into())
             }
         }
@@ -97,7 +97,7 @@ macro_rules! ffi_guard {
                         res.take();
                     }
                 });
-                //log_message("A PANIC occurred in FFI function.");
+                debug_log!("A PANIC occurred in FFI function.");
                 E_FAIL
             }
         }
@@ -114,7 +114,7 @@ macro_rules! ffi_guard {
                         res.take();
                     }
                 });
-                //log_message("A PANIC occurred in FFI function.");
+                debug_log!("A PANIC occurred in FFI function.");
                 false.into()
             }
         }
@@ -1595,10 +1595,6 @@ impl RegistryKeyGuard {
 
         Ok(RegistryKeyGuard(key))
     }
-    
-    // fn get(&self) -> HKEY {
-    //     self.0
-    // }
 
     fn create_root_key(hive: HKEY, name: &PCWSTR) -> Result<RegistryKeyGuard> {
         let mut key = HKEY::default();
@@ -1851,10 +1847,4 @@ fn get_formatted_time_string_win_api() -> String {
 //             print!("[DEBUG] Failed to serialize SVG document");
 //         }
 //     }
-// }
-
-
-
-// fn log_message(message: &str) {
-//     println!("{}", message);
 // }
