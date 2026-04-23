@@ -74,7 +74,9 @@ macro_rules! ffi_guard {
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 $tls.with(|resources| {
-                    resources.borrow_mut().take();
+                    if let Ok(mut res) = resources.try_borrow_mut() {
+                        res.take();
+                    }
                 });
                 //log_message("A PANIC occurred in FFI function.");
                 Err(E_FAIL.into())
@@ -89,7 +91,9 @@ macro_rules! ffi_guard {
             Ok(hr) => hr,
             Err(_) => {
                 $tls.with(|resources| {
-                    resources.borrow_mut().take();
+                    if let Ok(mut res) = resources.try_borrow_mut() {
+                        res.take();
+                    }
                 });
                 //log_message("A PANIC occurred in FFI function.");
                 E_FAIL
@@ -104,7 +108,9 @@ macro_rules! ffi_guard {
             Ok(success) => success.into(),
             Err(_) => {
                 $tls.with(|resources| {
-                    resources.borrow_mut().take();
+                    if let Ok(mut res) = resources.try_borrow_mut() {
+                        res.take();
+                    }
                 });
                 //log_message("A PANIC occurred in FFI function.");
                 false.into()
