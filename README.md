@@ -42,6 +42,9 @@ Note: Also see [current limitations](#current-limitations) section
 
 # How To Install
 
+> [!NOTE]
+> After installing, be sure to disable any other SVG thumbnail extensions which may interfere, like the one from PowerToys.
+
 ### Option 1 (Easiest): Install With WinGet
 
 Open command prompt and run this command, which will automatically download and run the installer.
