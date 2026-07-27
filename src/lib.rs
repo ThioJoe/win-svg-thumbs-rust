@@ -691,6 +691,45 @@ fn normalize_css_properties(properties: &str) -> String {
     result
 }
 
+/// The CSS token Direct2D refuses to honour, so it has to come out of both <style>
+/// content and inline style attributes before the document is handed to the renderer.
+const CSS_IMPORTANT: &str = "!important";
+
+/// Removes every occurrence of `needle` from `haystack`, ignoring ASCII case.
+///
+/// CSS keywords are case-insensitive, so `!IMPORTANT` has to be stripped exactly like
+/// `!important`, and `str::replace` is case-sensitive. Returns `None` when there is
+/// nothing to remove, so callers skip both the allocation and the DOM write in the common
+/// case where a style carries no `!important` at all.
+///
+/// `needle` must be non-empty ASCII (as `CSS_IMPORTANT` is): every match then begins and
+/// ends on a UTF-8 character boundary, so slicing `haystack` at those offsets is valid.
+fn remove_ignore_ascii_case(haystack: &str, needle: &str) -> Option<String> {
+    debug_assert!(needle.is_ascii() && !needle.is_empty());
+
+    let bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut result: Option<String> = None;
+    let mut copied_up_to = 0;
+    let mut i = 0;
+
+    while i + needle_bytes.len() <= bytes.len() {
+        if bytes[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes) {
+            let out = result.get_or_insert_with(|| String::with_capacity(haystack.len()));
+            out.push_str(&haystack[copied_up_to..i]);
+            i += needle_bytes.len();
+            copied_up_to = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    if let Some(out) = result.as_mut() {
+        out.push_str(&haystack[copied_up_to..]);
+    }
+    result
+}
+
 /// Processes an uncompressed SVG in a single MSXML DOM pass:
 /// 1. Extracts CSS from <style> tags
 /// 2. Strips !important from both <style> content and inline style attributes
@@ -701,7 +740,9 @@ fn normalize_css_properties(properties: &str) -> String {
 fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
     // First, do a quick check on the entire SVG data to see if !important exists anywhere, to know whether further processing is needed for that.
     // If so we'll want to remove !important from inline styles as well, because apparently Direct2D won't render any attributes with it.
-    let found_important = svg_data.windows(10).any(|w| w.eq_ignore_ascii_case(b"!important"));
+    let found_important = svg_data
+        .windows(CSS_IMPORTANT.len())
+        .any(|w| w.eq_ignore_ascii_case(CSS_IMPORTANT.as_bytes()));
 
     // MSXML is a COM library, so COM must be initialized on the current thread.
     let _com_guard = ComGuard::new()?;
@@ -739,13 +780,15 @@ fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
             if let Ok(css_bstr) = unsafe { node.text() } {
                 let css_text = css_bstr.to_string();
                 // Strip "!important" declarations from CSS content - not needed for SVGs and can cause rendering issues
-                let cleaned_css = css_text.replace("!important", "");
-
-                // Update the original node with the cleaned CSS to prevent issues during SVG processing
-                if cleaned_css != css_text {
-                    debug_log!("process_svg_styles: Cleaned !important from <style> element");
-                    let _ = unsafe { node.Settext(&BSTR::from(cleaned_css.clone())) };
-                }
+                let cleaned_css = match remove_ignore_ascii_case(&css_text, CSS_IMPORTANT) {
+                    Some(cleaned) => {
+                        // Update the original node with the cleaned CSS to prevent issues during SVG processing
+                        debug_log!("process_svg_styles: Cleaned !important from <style> element");
+                        let _ = unsafe { node.Settext(&BSTR::from(cleaned.as_str())) };
+                        cleaned
+                    }
+                    None => css_text,
+                };
 
                 combined_css.push_str(&cleaned_css);
                 combined_css.push('\n'); // Add a newline for separation.
@@ -769,9 +812,8 @@ fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
                     if let Ok(style_variant_raw) = unsafe { element.getAttribute(&bstr_style) } {
                         let style_variant = VariantGuard(style_variant_raw);
                         if let Ok(Some(raw_style)) = style_variant.try_as_string() {
-                            // Only process if this style attribute contains !important
-                            if raw_style.contains("!important") {
-                                let cleaned_style = raw_style.replace("!important", "");
+                            // Only rewrite the attribute if it actually carries !important
+                            if let Some(cleaned_style) = remove_ignore_ascii_case(&raw_style, CSS_IMPORTANT) {
                                 let variant_value = VariantGuard(VARIANT::from(BSTR::from(cleaned_style)));
 
                                 let _ = unsafe { element.setAttribute(&bstr_style, &variant_value) };
