@@ -77,55 +77,74 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
         "non-string panic payload".to_string()
     }
 }
+/// What a caught panic should do with the calling thread's cached Direct2D/D3D chain.
+#[derive(Clone, Copy, PartialEq)]
+enum GraphicsCacheOnPanic {
+    /// The entry point renders, so a panic may have interrupted D2D work and left the
+    /// cached device chain in an unknown state. Abandon it.
+    Discard,
+    /// The entry point never touches Direct2D, so no panic inside it can have corrupted
+    /// the cache. Discarding it here would abandon a whole device chain (permanently -
+    /// see `discard_graphics_cache_after_panic`) for nothing.
+    Keep,
+}
+
+/// Drops this thread's graphics cache out of TLS after a caught panic, when the entry
+/// point that panicked could plausibly have touched it.
+///
+/// The slot is cleared without releasing what was in it: the resources are `ManuallyDrop`,
+/// so this deliberately leaks a device chain (~1.47 MiB and ~24 kernel handles) rather
+/// than tearing down D2D/D3D objects whose state is unknown. That trade is only worth
+/// making when the panic could actually have corrupted them, hence the policy argument.
+fn discard_graphics_cache_after_panic(policy: GraphicsCacheOnPanic) {
+    if policy == GraphicsCacheOnPanic::Discard {
+        RESOURCES.with(|resources| {
+            if let Ok(mut res) = resources.try_borrow_mut() {
+                res.take();
+            }
+        });
+    }
+}
+
 /// Macro to wrap FFI functions with panic protection.
 /// This eliminates the boilerplate code for catch_unwind and error handling.
+///
+/// The first argument is the `GraphicsCacheOnPanic` variant for this entry point:
+/// `Discard` for anything that can reach `get_d2d_resources`, `Keep` for everything else.
 macro_rules! ffi_guard {
     // For functions that return Result<T>
-    ($tls:ident, Result<$ret_type:ty>, $body:expr) => {{
+    ($cache_policy:ident, Result<$ret_type:ty>, $body:expr) => {{
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(e)) => Err(e),
+            Ok(value) => value,
             Err(payload) => {
-                $tls.with(|resources| {
-                    if let Ok(mut res) = resources.try_borrow_mut() {
-                        res.take();
-                    }
-                });
+                discard_graphics_cache_after_panic(GraphicsCacheOnPanic::$cache_policy);
                 debug_log!( "A PANIC occurred in FFI function: {}", panic_payload_message(payload) );
                 Err(E_FAIL.into())
             }
         }
     }};
-    
+
     // For functions that return HRESULT directly
-    ($tls:ident, HRESULT, $body:expr) => {{
+    ($cache_policy:ident, HRESULT, $body:expr) => {{
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
             Ok(hr) => hr,
             Err(payload) => {
-                $tls.with(|resources| {
-                    if let Ok(mut res) = resources.try_borrow_mut() {
-                        res.take();
-                    }
-                });
+                discard_graphics_cache_after_panic(GraphicsCacheOnPanic::$cache_policy);
                 debug_log!( "A PANIC occurred in FFI function: {}", panic_payload_message(payload) );
                 E_FAIL
             }
         }
     }};
-    
+
     // For functions that return BOOL
-    ($tls:ident, BOOL, $body:expr) => {{
+    ($cache_policy:ident, BOOL, $body:expr) => {{
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
             Ok(success) => success.into(),
             Err(payload) => {
-                $tls.with(|resources| {
-                    if let Ok(mut res) = resources.try_borrow_mut() {
-                        res.take();
-                    }
-                });
+                discard_graphics_cache_after_panic(GraphicsCacheOnPanic::$cache_policy);
                 debug_log!( "A PANIC occurred in FFI function: {}", panic_payload_message(payload) );
                 false.into()
             }
@@ -253,7 +272,10 @@ struct ThreadResources {
 //     render thumbnails are shell/surrogate pool threads that in practice live until
 //     process exit, so nothing meaningful accumulates.
 //   - After a caught panic, ffi_guard clears the slot without dropping - leaking is the
-//     safest option when the resources are in an unknown state.
+//     safest option when the resources are in an unknown state. Only entry points that
+//     can actually reach this cache do so (GraphicsCacheOnPanic::Discard); a panic in,
+//     say, the stream-read loop cannot have touched it, and abandoning a device chain
+//     there would cost ~1.47 MiB and ~24 handles for nothing.
 //   - pin_module_in_memory() below guarantees the DLL (and its d2d1/d3d11/dxgi imports)
 //     is never unmapped while leaked or live caches exist.
 thread_local! {
@@ -1137,7 +1159,7 @@ impl Drop for ThumbnailProvider {
 impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_Impl {
     #[allow(non_snake_case)]
     fn Initialize(&self, pstream: Ref<'_, Com::IStream>, _grfmode: u32) -> Result<()> {
-        ffi_guard!(RESOURCES, Result<()>, {          
+        ffi_guard!(Keep, Result<()>, {          
             // log_message("Initialize: Starting SVG data loading");
             
             // Guard against repeated initialization calls
@@ -1192,14 +1214,25 @@ impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_I
                             }
                             break;
                         }
-                        
+
+                        // A stream cannot have written more than the buffer it was handed, so a
+                        // larger count is a broken (or hostile) ISequentialStream implementation.
+                        // Trusting it would index past `chunk` and panic; clamping instead would
+                        // append bytes the stream never actually wrote. Neither is acceptable for
+                        // data that is about to be parsed, so reject the stream outright.
+                        let bytes_read = bytes_read as usize;
+                        if bytes_read > chunk.len() {
+                            debug_log!("Initialize: Error - Stream reported {} bytes read into a {}-byte buffer", bytes_read, chunk.len());
+                            return Err(Error::new(E_UNEXPECTED, "Stream reported reading more bytes than were requested"));
+                        }
+
                         // Extra file size safety net protects memory usage in case statstg failed or returned a wrong size.
-                        if buffer.len() + (bytes_read as usize) > (MAX_SIZE as usize) {
-                            debug_log!("Initialize: Error - File too large during read: {} bytes (max: {} bytes)", buffer.len() + (bytes_read as usize), MAX_SIZE);
+                        if buffer.len() + bytes_read > (MAX_SIZE as usize) {
+                            debug_log!("Initialize: Error - File too large during read: {} bytes (max: {} bytes)", buffer.len() + bytes_read, MAX_SIZE);
                             return Err(Error::from(HRESULT::from_win32(ERROR_FILE_TOO_LARGE.0)));
                         }
-                        
-                        buffer.extend_from_slice(&chunk[..bytes_read as usize]);
+
+                        buffer.extend_from_slice(&chunk[..bytes_read]);
                     }
                     
                     // log_message(&format!("Initialize: Successfully loaded {} bytes of SVG data", buffer.len()));
@@ -1223,7 +1256,9 @@ impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_I
 impl Shell::IThumbnailProvider_Impl for ThumbnailProvider_Impl {
     #[allow(non_snake_case)]
     fn GetThumbnail(&self, cx: u32, phbmp: *mut Gdi::HBITMAP, pdwalpha: *mut Shell::WTS_ALPHATYPE) -> Result<()> {
-        ffi_guard!(RESOURCES, Result<()>, {
+        // The only entry point that renders, so the only one where a caught panic can
+        // have left this thread's cached D2D/D3D chain in an unusable state.
+        ffi_guard!(Discard, Result<()>, {
             // log_message(&format!("GetThumbnail: Entered with size: {}x{}", cx, cx));
 			
 			// Both output pointers are dereferenced unconditionally below, so they must be
@@ -1384,7 +1419,7 @@ impl Drop for ClassFactory {
 impl Com::IClassFactory_Impl for ClassFactory_Impl {
     #[allow(non_snake_case)]
     fn CreateInstance(&self, punkouter: Ref<'_, IUnknown>, riid: *const GUID, ppvobject: *mut *mut std::ffi::c_void) -> Result<()> {
-        ffi_guard!(RESOURCES, Result<()>, {           
+        ffi_guard!(Keep, Result<()>, {           
             // log_message(&format!("ClassFactory::CreateInstance: Entered. Requesting interface: {:?}", unsafe { *riid }));
 
             // Safety checks for null pointers
@@ -1418,7 +1453,7 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
 
     #[allow(non_snake_case)]
     fn LockServer(&self, flock: BOOL) -> Result<()> {
-        ffi_guard!(RESOURCES, Result<()>, {
+        ffi_guard!(Keep, Result<()>, {
             if flock.as_bool() {
                 debug_log!("ClassFactory::LockServer: Locking server (adding reference)");
                 dll_add_ref();
@@ -1561,7 +1596,7 @@ extern "system" fn DllMain(hinst_dll: HMODULE, fdw_reason: u32, _lpv_reserved: *
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut std::ffi::c_void) -> HRESULT {
-    ffi_guard!(RESOURCES, HRESULT, {
+    ffi_guard!(Keep, HRESULT, {
         // Guarantee registry reads happen exactly once per process, completely off the loader lock.
         INIT_REGISTRY.call_once(|| {
             check_debug_logging_registry();
@@ -1608,7 +1643,7 @@ pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID,
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    ffi_guard!(RESOURCES, HRESULT, {
+    ffi_guard!(Keep, HRESULT, {
         let ref_count = DLL_REFERENCES.load(Ordering::Acquire);
         
         if ref_count == 0 {
@@ -1825,7 +1860,7 @@ fn delete_registry_keys() -> Result<()> {
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllRegisterServer() -> HRESULT {
-    ffi_guard!(RESOURCES, HRESULT, {
+    ffi_guard!(Keep, HRESULT, {
         // log_message("DllRegisterServer: Starting registration");
         match create_registry_keys() {
             Ok(_) => {
@@ -1843,7 +1878,7 @@ pub extern "system" fn DllRegisterServer() -> HRESULT {
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllUnregisterServer() -> HRESULT {
-    ffi_guard!(RESOURCES, HRESULT, {
+    ffi_guard!(Keep, HRESULT, {
         // log_message("DllUnregisterServer: Starting unregistration");
         match delete_registry_keys() {
             Ok(_) => {
@@ -1861,7 +1896,7 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
 #[no_mangle]
 // Simple function that only notifies the shell of file association changes.
 pub extern "system" fn notify_shell_change() -> HRESULT {
-    ffi_guard!(RESOURCES, HRESULT, {
+    ffi_guard!(Keep, HRESULT, {
         // Notify the shell that file associations have changed
         unsafe { Shell::SHChangeNotify(Shell::SHCNE_ASSOCCHANGED, Shell::SHCNF_IDLIST, None, None) };
         S_OK
