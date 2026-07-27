@@ -975,6 +975,24 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
         
         // 6. Map the staging bitmap to get a pointer to the pixel data using RAII guard
         let (map_guard, mapped_rect) = BitmapMapGuard::new(&staging_bitmap)?;
+
+        let dest_stride: usize = (requested_width * 4) as usize;
+        let source_stride: usize = mapped_rect.pitch as usize;
+
+        // A successful map must provide a valid buffer with enough bytes for
+        // one complete BGRA row before it is used to construct a Rust slice.
+        if mapped_rect.bits.is_null() || source_stride < dest_stride {
+            debug_log!(
+                "render_svg_to_hbitmap: Invalid mapped bitmap (pitch={}, required={}, bits_null={})",
+                source_stride,
+                dest_stride,
+                mapped_rect.bits.is_null()
+            );
+            return Err(Error::new(
+                E_FAIL,
+                "Mapped D2D bitmap has a null buffer or insufficient row pitch",
+            ));
+        }
         
         // 7. Create the final GDI HBITMAP
         // This creates a separate GDI bitmap with its own memory buffer
@@ -1015,8 +1033,6 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
             // No pre-initialization needed: the loop below writes every byte of dest_data
             // (dest stride == width*4, matching the 32-bpp GDI DIB section with no padding).
             // This replaces the previous GPU-based D2D UnPremultiply effect.
-            let dest_stride: usize = (requested_width * 4) as usize;
-            let source_stride: usize = mapped_rect.pitch as usize;
 
             for y in 0..requested_height as usize {
                 let src_start: usize = y * source_stride;
