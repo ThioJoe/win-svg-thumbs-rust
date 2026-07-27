@@ -1454,12 +1454,19 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
     #[allow(non_snake_case)]
     fn LockServer(&self, flock: BOOL) -> Result<()> {
         ffi_guard!(Keep, Result<()>, {
+            // Server locks are counted separately from live objects (see SERVER_LOCKS):
+            // a client that unlocks without a matching lock must not be able to consume a
+            // reference that belongs to a living provider.
             if flock.as_bool() {
-                debug_log!("ClassFactory::LockServer: Locking server (adding reference)");
-                dll_add_ref();
+                let locks = SERVER_LOCKS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+                debug_log!("ClassFactory::LockServer: Server locked. Outstanding locks: {}", locks);
             } else {
-                debug_log!("ClassFactory::LockServer: Unlocking server (releasing reference)");
-                dll_release();
+                let locks = SERVER_LOCKS.fetch_sub(1, Ordering::Release).saturating_sub(1);
+                if locks < 0 {
+                    debug_log!("ClassFactory::LockServer: Unmatched unlock, lock balance now {}", locks);
+                } else {
+                    debug_log!("ClassFactory::LockServer: Server unlocked. Outstanding locks: {}", locks);
+                }
             }
             Ok(())
         })
@@ -1470,8 +1477,20 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
 //                      DLL Global State & Exports
 // =================================================================
 
-// A global reference counter for the DLL itself.
+// A global reference counter for the DLL itself: one reference per live COM object.
 static DLL_REFERENCES: AtomicU32 = AtomicU32::new(0);
+// Outstanding IClassFactory::LockServer(TRUE) locks, counted separately from live objects.
+//
+// A client that calls LockServer(FALSE) without a matching lock is violating the COM
+// contract, but folding that unmatched unlock into DLL_REFERENCES would let it consume a
+// reference belonging to a live provider - and then DllCanUnloadNow reports S_OK while
+// that provider is still in use, which entitles COM to FreeLibrary the DLL out from under
+// it. Keeping the two counters apart confines the damage to the lock ledger.
+//
+// Signed on purpose: an over-release goes negative rather than being clamped, so a client
+// that unlocks once too often and then locks again ends up balanced instead of leaving a
+// lock outstanding that nothing can ever release. Any balance <= 0 means "no locks held".
+static SERVER_LOCKS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 // A global handle to the DLL module instance - using Option for safer null checking
 static MODULE_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 // Global flag for hardware acceleration preference (defaults to false = WARP)
@@ -1486,8 +1505,13 @@ fn dll_add_ref() {
     debug_log!("DLL reference added. New count: {}", new_count);
 }
 fn dll_release() {
-    let old_count = DLL_REFERENCES.fetch_sub(1, Ordering::Release);
-    debug_log!("DLL reference released. New count: {}", old_count - 1);
+    // Saturating: the count must never wrap to a huge value, which would keep the DLL
+    // mapped for the life of the process, nor below zero, which would understate the
+    // number of live objects.
+    let old_count = DLL_REFERENCES
+        .fetch_update(Ordering::Release, Ordering::Relaxed, |count| Some(count.saturating_sub(1)))
+        .unwrap_or(0); // The update closure never returns None, so this is always Ok.
+    debug_log!("DLL reference released. New count: {}", old_count.saturating_sub(1));
 }
 
 /// Generic function to read registry values from HKEY_CLASSES_ROOT\.svg
@@ -1645,12 +1669,13 @@ pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID,
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     ffi_guard!(Keep, HRESULT, {
         let ref_count = DLL_REFERENCES.load(Ordering::Acquire);
-        
-        if ref_count == 0 {
+        let lock_count = SERVER_LOCKS.load(Ordering::Acquire);
+
+        if ref_count == 0 && lock_count <= 0 {
             debug_log!("DllCanUnloadNow: Returning S_OK - DLL can be unloaded");
             S_OK
         } else {
-            debug_log!("DllCanUnloadNow: Returning S_FALSE - DLL still has {} active references", ref_count);
+            debug_log!("DllCanUnloadNow: Returning S_FALSE - DLL still has {} active references and {} server locks", ref_count, lock_count);
             S_FALSE
         }
     })
