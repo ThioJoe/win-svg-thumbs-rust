@@ -1005,54 +1005,61 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
         let hbitmap_handle: Gdi::HBITMAP = unsafe {
             Gdi::CreateDIBSection(None, &bmi, Gdi::DIB_RGB_COLORS, &mut dib_data, None, 0)
         }?;
-        let hbitmap_guard = HBitmapGuard::new(hbitmap_handle);
+
+        // CreateDIBSection succeeded, so it must also have returned a writable pixel buffer.
+        // Treat an inconsistent result as an error rather than returning an uninitialized bitmap as a successful thumbnail.
+        let hbitmap_guard = HBitmapGuard::new(hbitmap_handle); 
+
+        // The returned HBITMAP was already validated by the Result and `?`.
+        // Verify the separate output buffer before constructing a Rust slice from it.
+        if dib_data.is_null() {
+            return Err(Error::new( E_FAIL, "CreateDIBSection returned a null pixel buffer", ));
+        }
         
         // 8. Copy pixels from the mapped D2D buffer to the GDI HBITMAP buffer
-        if !dib_data.is_null() {
-            // SECURITY LOGIC: Always promote pitch * height to u64 before casting to usize.
-            // This prevents integer overflow if a malicious or buggy driver returns a huge pitch.
-            // Without this, a wrapped value could create a dangerously small slice, leading to a heap buffer overflow when copying rows below.
-            // Do not remove this check: it is critical for safe memory access.
-            let source_buffer_size_64 = (mapped_rect.pitch as u64) * (requested_height as u64);
+        // SECURITY LOGIC: Always promote pitch * height to u64 before casting to usize.
+        // This prevents integer overflow if a malicious or buggy driver returns a huge pitch.
+        // Without this, a wrapped value could create a dangerously small slice, leading to a heap buffer overflow when copying rows below.
+        // Do not remove this check: it is critical for safe memory access.
+        let source_buffer_size_64 = (mapped_rect.pitch as u64) * (requested_height as u64);
 
-            // On 32-bit systems, usize is 32 bits. Ensure the calculated size fits.
-            if source_buffer_size_64 > usize::MAX as u64 {
-                // Defensive: If this ever triggers, the driver is returning a bogus pitch, or there is something deeply wrong with the D2D bitmap.
-                return Err(Error::new(E_FAIL, "Calculated source buffer size exceeds addressable memory."));
-            }
-            let source_buffer_size = source_buffer_size_64 as usize;
+        // On 32-bit systems, usize is 32 bits. Ensure the calculated size fits.
+        if source_buffer_size_64 > usize::MAX as u64 {
+            // Defensive: If this ever triggers, the driver is returning a bogus pitch, or there is something deeply wrong with the D2D bitmap.
+            return Err(Error::new(E_FAIL, "Calculated source buffer size exceeds addressable memory."));
+        }
+        let source_buffer_size = source_buffer_size_64 as usize;
 
-            // Create safe slices from the raw pointers.
-            let source_data: &[u8] = unsafe { 
-                std::slice::from_raw_parts(mapped_rect.bits, source_buffer_size) 
-            };
-            let dest_data: &mut [u8] = unsafe { 
-                std::slice::from_raw_parts_mut(dib_data.cast::<u8>(), (requested_width * requested_height * 4) as usize) 
-            };
-            // Copy pixels from source to dest, un-premultiplying alpha on the CPU.
-            // No pre-initialization needed: the loop below writes every byte of dest_data
-            // (dest stride == width*4, matching the 32-bpp GDI DIB section with no padding).
-            // This replaces the previous GPU-based D2D UnPremultiply effect.
+        // Create safe slices from the raw pointers.
+        let source_data: &[u8] = unsafe { 
+            std::slice::from_raw_parts(mapped_rect.bits, source_buffer_size) 
+        };
+        let dest_data: &mut [u8] = unsafe { 
+            std::slice::from_raw_parts_mut(dib_data.cast::<u8>(), (requested_width * requested_height * 4) as usize) 
+        };
+        // Copy pixels from source to dest, un-premultiplying alpha on the CPU.
+        // No pre-initialization needed: the loop below writes every byte of dest_data
+        // (dest stride == width*4, matching the 32-bpp GDI DIB section with no padding).
+        // This replaces the previous GPU-based D2D UnPremultiply effect.
 
-            for y in 0..requested_height as usize {
-                let src_start: usize = y * source_stride;
-                let dest_start: usize = y * dest_stride;
+        for y in 0..requested_height as usize {
+            let src_start: usize = y * source_stride;
+            let dest_start: usize = y * dest_stride;
 
-                let src_slice = &source_data[src_start .. src_start + dest_stride];
-                let dest_slice = &mut dest_data[dest_start .. dest_start + dest_stride];
+            let src_slice = &source_data[src_start .. src_start + dest_stride];
+            let dest_slice = &mut dest_data[dest_start .. dest_start + dest_stride];
 
-                // Copy pixels and un-premultiply simultaneously
-                for i in (0..dest_stride).step_by(4) {
-                    let a = src_slice[i + 3] as u32;
-                    if a == 0 || a == 255 {
-                        dest_slice[i..i+4].copy_from_slice(&src_slice[i..i+4]);
-                    } else {
-                        // Un-premultiply: Color = (Premultiplied * 255 + Rounding) / Alpha
-                        dest_slice[i]   = (((src_slice[i] as u32 * 255) + (a / 2)) / a).min(255) as u8;   // B
-                        dest_slice[i+1] = (((src_slice[i+1] as u32 * 255) + (a / 2)) / a).min(255) as u8; // G
-                        dest_slice[i+2] = (((src_slice[i+2] as u32 * 255) + (a / 2)) / a).min(255) as u8; // R
-                        dest_slice[i+3] = a as u8;                                                        // A
-                    }
+            // Copy pixels and un-premultiply simultaneously
+            for i in (0..dest_stride).step_by(4) {
+                let a = src_slice[i + 3] as u32;
+                if a == 0 || a == 255 {
+                    dest_slice[i..i+4].copy_from_slice(&src_slice[i..i+4]);
+                } else {
+                    // Un-premultiply: Color = (Premultiplied * 255 + Rounding) / Alpha
+                    dest_slice[i]   = (((src_slice[i] as u32 * 255) + (a / 2)) / a).min(255) as u8;   // B
+                    dest_slice[i+1] = (((src_slice[i+1] as u32 * 255) + (a / 2)) / a).min(255) as u8; // G
+                    dest_slice[i+2] = (((src_slice[i+2] as u32 * 255) + (a / 2)) / a).min(255) as u8; // R
+                    dest_slice[i+3] = a as u8;                                                        // A
                 }
             }
         }
@@ -1291,18 +1298,24 @@ fn create_fallback_thumbnail(size: u32) -> Result<Gdi::HBITMAP> {
             let hbitmap_handle: Gdi::HBITMAP = unsafe {
                 Gdi::CreateDIBSection(None, &bmi, Gdi::DIB_RGB_COLORS, &mut dib_data, None, 0)
             }?;
+
             let hbitmap_guard = HBitmapGuard::new(hbitmap_handle);
 
-            if !dib_data.is_null() {
-                // Fill with solid black (BGRA format: 0xFF000000)
-                let pixel_count = (size * size) as usize;
-                let buffer: &mut [u32] = unsafe {
-                    std::slice::from_raw_parts_mut(dib_data as *mut u32, pixel_count)
-                };
-                
-                // Solid black with full alpha
-                buffer.fill(0xFF000000);
+            if dib_data.is_null() {
+                return Err(Error::new(
+                    E_FAIL,
+                    "CreateDIBSection returned a null fallback pixel buffer",
+                ));
             }
+
+            // Fill with solid black (BGRA format: 0xFF000000)
+            let pixel_count = (size * size) as usize;
+            let buffer: &mut [u32] = unsafe {
+                std::slice::from_raw_parts_mut(dib_data as *mut u32, pixel_count)
+            };
+            
+            // Solid black with full alpha
+            buffer.fill(0xFF000000);
 
             debug_log!("create_fallback_thumbnail: Successfully created bitmap-based fallback");
             Ok(hbitmap_guard.release())
