@@ -1223,9 +1223,18 @@ impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_I
 impl Shell::IThumbnailProvider_Impl for ThumbnailProvider_Impl {
     #[allow(non_snake_case)]
     fn GetThumbnail(&self, cx: u32, phbmp: *mut Gdi::HBITMAP, pdwalpha: *mut Shell::WTS_ALPHATYPE) -> Result<()> {
-        ffi_guard!(RESOURCES, Result<()>, {      
+        ffi_guard!(RESOURCES, Result<()>, {
             // log_message(&format!("GetThumbnail: Entered with size: {}x{}", cx, cx));
-
+			
+			// Both output pointers are dereferenced unconditionally below, so they must be
+            // validated first. The Shell is expected to supply valid pointers, but this is a public
+            // COM vtable entry: any in-process caller can reach it, and dereferencing a null
+            // here would take down the host process instead of returning a clean E_POINTER.
+            if phbmp.is_null() || pdwalpha.is_null() {
+                debug_log!("GetThumbnail: Error - Null output pointer (phbmp_null={}, pdwalpha_null={})", phbmp.is_null(), pdwalpha.is_null());
+                return Err(Error::new(E_POINTER, "Null output pointer passed to GetThumbnail"));
+            }
+			
             // Initialize output parameters to safe defaults (COM contract requirement)
             // pdwalpha is set to UNKNOWN for all failure cases, only changed to ARGB on success
             unsafe {
