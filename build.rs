@@ -18,15 +18,15 @@ fn main() {
     match target_arch.as_str() {
         "x86_64" => {
             let dll_path = target_dir.join("win_svg_thumbs_x64.dll");
-            println!("cargo:rustc-link-arg=/OUT:{}", dll_path.display());
+            println!( "cargo:rustc-link-arg-cdylib=/OUT:{}", dll_path.display() );
         },
         "x86" => {
             let dll_path = target_dir.join("win_svg_thumbs_x86.dll");
-            println!("cargo:rustc-link-arg=/OUT:{}", dll_path.display());
+            println!( "cargo:rustc-link-arg-cdylib=/OUT:{}", dll_path.display() );
         },
         "aarch64" => {
             let dll_path = target_dir.join("win_svg_thumbs_arm64.dll");
-            println!("cargo:rustc-link-arg=/OUT:{}", dll_path.display());
+            println!( "cargo:rustc-link-arg-cdylib=/OUT:{}", dll_path.display() );
         },
         _ => {}
     }
