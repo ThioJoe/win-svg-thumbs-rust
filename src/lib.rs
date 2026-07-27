@@ -66,6 +66,17 @@ static INIT_REGISTRY: Once = Once::new(); // Track if registry settings were alr
 //                  FFI Panic Safety Macro
 // =================================================================
 
+/// Format a panic payload for debug logging without allocating when logging is off
+/// (caller should only invoke this inside debug_log! / after checking the flag).
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
 /// Macro to wrap FFI functions with panic protection.
 /// This eliminates the boilerplate code for catch_unwind and error handling.
 macro_rules! ffi_guard {
@@ -75,13 +86,13 @@ macro_rules! ffi_guard {
         match result {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(e)) => Err(e),
-            Err(_) => {
+            Err(payload) => {
                 $tls.with(|resources| {
                     if let Ok(mut res) = resources.try_borrow_mut() {
                         res.take();
                     }
                 });
-                debug_log!("A PANIC occurred in FFI function.");
+                debug_log!( "A PANIC occurred in FFI function: {}", panic_payload_message(payload) );
                 Err(E_FAIL.into())
             }
         }
@@ -92,13 +103,13 @@ macro_rules! ffi_guard {
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
             Ok(hr) => hr,
-            Err(_) => {
+            Err(payload) => {
                 $tls.with(|resources| {
                     if let Ok(mut res) = resources.try_borrow_mut() {
                         res.take();
                     }
                 });
-                debug_log!("A PANIC occurred in FFI function.");
+                debug_log!( "A PANIC occurred in FFI function: {}", panic_payload_message(payload) );
                 E_FAIL
             }
         }
@@ -109,13 +120,13 @@ macro_rules! ffi_guard {
         let result = catch_unwind(AssertUnwindSafe(|| $body));
         match result {
             Ok(success) => success.into(),
-            Err(_) => {
+            Err(payload) => {
                 $tls.with(|resources| {
                     if let Ok(mut res) = resources.try_borrow_mut() {
                         res.take();
                     }
                 });
-                debug_log!("A PANIC occurred in FFI function.");
+                debug_log!( "A PANIC occurred in FFI function: {}", panic_payload_message(payload) );
                 false.into()
             }
         }
