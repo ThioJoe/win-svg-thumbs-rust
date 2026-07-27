@@ -1,0 +1,41 @@
+[package]
+name = "gauntlet"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Adversarial test gauntlet for the SVG thumbnail provider DLL"
+
+[dependencies]
+# The gauntlet never links against win_svg_thumbs. It loads the built DLL with
+# LoadLibrary and talks to it purely through its COM surface, so it exercises the
+# exact binary that ships rather than a statically linked copy of the sources.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+# The #[implement] macro (used for the hostile IStream implementations in
+# streams.rs) expands to code that names the `windows_core` crate directly, so
+# it must be a direct dependency even though everything else goes through
+# `windows::core`.
+windows-core = "0.61"
+
+# Used only to build the .svgz corpus (including the decompression bomb, which
+# needs real DEFLATE ratios). Pure-Rust backend, no C toolchain required.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[[bin]]
+name = "gauntlet"
+path = "src/main.rs"

@@ -2,7 +2,7 @@
 # outcome so the workflow can distinguish a genuine crash/hang (bug reproduced)
 # from a harness or precondition failure (inconclusive).
 #
-# Harness exit-code contract (see unload-harness/src/main.rs):
+# Harness exit-code contract (see Testing/unload-harness/src/main.rs):
 #   0        survived
 #   2        usage error                (harness)
 #   3        unload precondition failed (DllCanUnloadNow was not S_OK)

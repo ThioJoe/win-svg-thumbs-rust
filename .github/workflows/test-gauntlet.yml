@@ -1,0 +1,662 @@
+# Per-commit adversarial test gauntlet for the SVG thumbnail provider.
+#
+# Where unload-crash-repro targets one specific known bug, this workflow tries to
+# break the provider in every other way: malformed and hostile SVG/SVGZ input,
+# COM contract abuse, lying IStream implementations, XML external entities,
+# concurrency, thread churn and resource retention, plus a real-world icon
+# corpus.
+#
+# Structure:
+#   build    - compiles the DLL and the gauntlet once, publishes them as artifacts
+#   corpus   - fetches and caches a pinned slice of microsoft/fluentui-system-icons
+#   gauntlet - one job per suite, in parallel, each with crash dumps and a watchdog
+#   verdict  - aggregates the matrix into a single pass/fail and a job summary
+#
+# Every suite runs in its own child process under a watchdog inside the gauntlet
+# supervisor, so a crash or deadlock in one suite is reported with the exact
+# input that caused it rather than taking down the run.
+name: test-gauntlet
+
+on:
+  push:
+    branches:
+      - master
+      - 'claude/**'
+    paths:
+      - 'src/**'
+      - 'Testing/gauntlet/**'
+      - 'Testing/unload-harness/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/test-gauntlet.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Testing/gauntlet/**'
+      - 'Testing/unload-harness/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/test-gauntlet.yml'
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: 'Workload multiplier (1 = per-commit default; raise for a deeper run)'
+        type: string
+        default: '1'
+      seed:
+        description: 'Fixed RNG seed to replay a previous run (blank = new random seed)'
+        type: string
+        default: ''
+      suites:
+        description: 'Space-separated suite names to run (blank = all)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  # Needed by the verdict job to list this run's jobs for the summary table.
+  actions: read
+
+# A push that supersedes an in-flight run should cancel it: the gauntlet is
+# expensive and only the newest commit's result matters.
+concurrency:
+  group: test-gauntlet-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so the corpus is reproducible and the cache key is stable.
+  # microsoft/fluentui-system-icons is MIT licensed; nothing from it is vendored
+  # into this repository, it is only downloaded for testing.
+  FLUENT_ICONS_SHA: 5ecd79ea56f2be0169859b3b881dcc890be932fc
+  CARGO_TERM_COLOR: always
+  # Keep incremental artifacts out of the cache: they are large and useless
+  # across machines.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ---------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      # One architecture failing to build must not hide the results for the
+      # others: the whole point of this matrix is to compare them.
+      fail-fast: false
+      matrix:
+        include:
+          # The primary architecture, and the one the full per-suite matrix runs on.
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            runs-on: windows-latest
+            dll: win_svg_thumbs_x64.dll
+          # The x64 MSI installs this alongside the 64-bit DLL, because 32-bit
+          # applications hosting the shell's thumbnail path load the 32-bit
+          # provider. It is also where the pointer- and usize-width arithmetic in
+          # the bitmap copy actually differs.
+          - arch: x86
+            target: i686-pc-windows-msvc
+            runs-on: windows-latest
+            dll: win_svg_thumbs_x86.dll
+          # Native ARM64, built and tested on real ARM hardware rather than
+          # cross-compiled and left unexercised.
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            runs-on: windows-11-arm
+            dll: win_svg_thumbs_arm64.dll
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo registry and git checkouts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          # Cargo.lock is gitignored in this repository, so the manifests are the
+          # best available key. restore-keys lets a changed manifest still start
+          # from the previous download set instead of a cold registry.
+          key: cargo-registry-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-registry-${{ matrix.arch }}-
+
+      - name: Cache build outputs
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}-${{ hashFiles('src/**/*.rs', 'Testing/gauntlet/**/*.rs', 'build.rs') }}
+          restore-keys: |
+            cargo-target-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}-
+            cargo-target-${{ matrix.arch }}-
+
+      - name: Toolchain info and target install
+        run: |
+          rustc -Vv
+          cargo -V
+          rustup target add ${{ matrix.target }}
+
+      - name: Build provider DLL (release)
+        run: cargo build --release --target ${{ matrix.target }} -p win_svg_thumbs
+
+      - name: Build gauntlet (release)
+        # The gauntlet loads the DLL with LoadLibraryW, so its own bitness must
+        # match: a 64-bit process cannot load the 32-bit provider. Building it
+        # per-target is what makes the x86 lane meaningful rather than a
+        # 64-bit harness pretending.
+        #
+        # Release so the harness is not the bottleneck in the throughput and
+        # churn suites; the DLL under test is what we want to measure.
+        run: cargo build --release --target ${{ matrix.target }} -p gauntlet
+
+      - name: Record binary hashes
+        run: |
+          $out = "target/${{ matrix.target }}/release"
+          $dll = Get-FileHash "$out/${{ matrix.dll }}" -Algorithm SHA256
+          $exe = Get-FileHash "$out/gauntlet.exe" -Algorithm SHA256
+          Write-Host "arch    : ${{ matrix.arch }} (${{ matrix.target }})"
+          Write-Host "dll     : $($dll.Hash)"
+          Write-Host "gauntlet: $($exe.Hash)"
+
+      - name: List available suites
+        # Only meaningful when the harness can actually run on this host: the
+        # arm64 harness runs natively here, x86 runs under WOW64, and both are
+        # fine on their build machines.
+        run: ./target/${{ matrix.target }}/release/gauntlet.exe list
+
+      - name: Stage binaries under a stable layout
+        run: |
+          New-Item -ItemType Directory -Force -Path staged | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.dll }}" staged/
+          Copy-Item "target/${{ matrix.target }}/release/gauntlet.exe" staged/
+          Get-ChildItem "target/${{ matrix.target }}/release/*.pdb" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'win_svg_thumbs|gauntlet' } |
+            Copy-Item -Destination staged/
+          # Record the provider filename so the test lanes do not have to know
+          # the per-architecture naming from build.rs.
+          "${{ matrix.dll }}" | Out-File staged/dll-name.txt -Encoding ascii -NoNewline
+          Get-ChildItem staged | Format-Table Name, Length
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: staged/**
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------
+  corpus:
+    name: Fetch real-world SVG corpus
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Restore cached corpus
+        id: corpus-cache
+        uses: actions/cache@v6
+        with:
+          path: svg-corpus
+          # Keyed on the pinned commit and the selection recipe, so changing
+          # either produces a fresh corpus and nothing else does.
+          key: svg-corpus-fluent-${{ env.FLUENT_ICONS_SHA }}-v1
+
+      - name: Fetch and select corpus (cache miss only)
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: |
+          # Sparse checkout of only the SVG variants we sample, at a pinned
+          # commit. Blob-filtered so the huge non-SVG assets are never fetched.
+          git clone --filter=blob:none --no-checkout https://github.com/microsoft/fluentui-system-icons.git fluent
+          Push-Location fluent
+          git sparse-checkout init --no-cone
+          git sparse-checkout set 'assets/*/SVG/*_24_regular.svg' 'assets/*/SVG/*_48_filled.svg' 'assets/*/SVG/*_20_regular.svg'
+          git checkout $env:FLUENT_ICONS_SHA
+          Pop-Location
+
+          $all = Get-ChildItem fluent/assets -Recurse -Filter *.svg | Sort-Object FullName
+          Write-Host "fetched $($all.Count) SVGs from fluentui-system-icons@$env:FLUENT_ICONS_SHA"
+          if ($all.Count -lt 200) { throw "too few SVGs fetched ($($all.Count)); the sparse-checkout patterns are probably stale" }
+
+          # Stride sampling across the alphabetically sorted set, so the corpus
+          # spans the whole icon library instead of the first N names.
+          $target = 800
+          $stride = [Math]::Max(1, [int]($all.Count / $target))
+          $sel = for ($i = 0; $i -lt $all.Count; $i += $stride) { $all[$i] }
+          New-Item -ItemType Directory -Force -Path svg-corpus | Out-Null
+          $manifest = @("# microsoft/fluentui-system-icons @ $env:FLUENT_ICONS_SHA (MIT); downloaded for testing only, not vendored", 'name,repo_path,bytes,sha256')
+          $root = (Resolve-Path fluent).Path
+          $i = 0
+          foreach ($f in $sel) {
+            $icon = ($f.Directory.Parent.Name -replace '[^A-Za-z0-9_-]', '_')
+            $name = '{0:d4}_{1}_{2}' -f $i, $icon, ($f.Name -replace '[^A-Za-z0-9._-]', '_')
+            Copy-Item $f.FullName (Join-Path svg-corpus $name)
+            $rel = $f.FullName.Substring($root.Length + 1) -replace '\\', '/'
+            $manifest += "$name,$rel,$($f.Length),$((Get-FileHash $f.FullName -Algorithm SHA256).Hash)"
+            $i++
+          }
+          $manifest | Out-File svg-corpus/MANIFEST.csv -Encoding utf8
+          Write-Host "selected $i SVGs (stride $stride) into svg-corpus/"
+          Remove-Item -Recurse -Force fluent
+
+      - name: Report corpus size
+        run: |
+          $n = (Get-ChildItem svg-corpus -Filter *.svg -ErrorAction SilentlyContinue).Count
+          Write-Host "corpus contains $n SVG files"
+          if ($n -lt 100) { throw "corpus too small ($n files)" }
+
+      - name: Upload corpus
+        uses: actions/upload-artifact@v7
+        with:
+          name: svg-corpus
+          path: svg-corpus
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------
+  gauntlet:
+    name: x64 / ${{ matrix.suite }}
+    needs: [build, corpus]
+    runs-on: windows-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      # One failing suite must not cancel the others: the whole point is to get
+      # a complete picture of what broke in a single run.
+      fail-fast: false
+      matrix:
+        include:
+          - suite: api-misuse
+            timeout: 20
+          - suite: stream-faults
+            timeout: 30
+          - suite: render
+            timeout: 30
+          - suite: adversarial
+            timeout: 45
+          - suite: svgz
+            timeout: 30
+          - suite: size-limits
+            timeout: 30
+          - suite: lifecycle
+            timeout: 30
+          - suite: concurrency
+            timeout: 30
+          - suite: churn
+            timeout: 45
+          - suite: breadth
+            timeout: 45
+    steps:
+      - name: Skip suites not selected by workflow_dispatch
+        id: gate
+        run: |
+          $requested = '${{ inputs.suites }}'.Trim()
+          if ($requested -and ($requested -split '\s+') -notcontains '${{ matrix.suite }}') {
+            Write-Host "suite '${{ matrix.suite }}' not in the requested set ($requested); skipping"
+            "run=false" >> $env:GITHUB_OUTPUT
+          } else {
+            "run=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - uses: actions/download-artifact@v8
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: binaries-x64
+          path: bin
+
+      - name: Download corpus (breadth suite only)
+        if: steps.gate.outputs.run == 'true' && matrix.suite == 'breadth'
+        uses: actions/download-artifact@v8
+        with:
+          name: svg-corpus
+          path: svg-corpus
+
+      - name: Enable WER LocalDumps for the gauntlet process
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          # Full dumps for anything that faults, so a crash in a child suite
+          # process leaves a debuggable artifact rather than just an exit code.
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dumps" | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\gauntlet.exe" /v DumpType /t REG_DWORD /d 2 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\gauntlet.exe" /v DumpCount /t REG_DWORD /d 10 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\gauntlet.exe" /v DumpFolder /t REG_EXPAND_SZ /d "$env:GITHUB_WORKSPACE\dumps" /f
+
+      - name: Record run start
+        if: steps.gate.outputs.run == 'true'
+        run: "\"RUN_START=$(Get-Date -Format o)\" >> $env:GITHUB_ENV"
+
+      - name: Run suite
+        id: run
+        if: steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        run: |
+          $seed = '${{ inputs.seed }}'.Trim()
+          $scale = '${{ inputs.scale }}'.Trim()
+          if (-not $scale) { $scale = '1' }
+          $args = @('run', '--suite', '${{ matrix.suite }}',
+                    '--dll', "$env:GITHUB_WORKSPACE\bin\win_svg_thumbs_x64.dll",
+                    '--scale', $scale,
+                    '--corpus', "$env:GITHUB_WORKSPACE\svg-corpus",
+                    '--work-dir', "$env:GITHUB_WORKSPACE\gauntlet-work")
+          if ($seed) { $args += @('--seed', $seed) }
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          $log = "$env:GITHUB_WORKSPACE\logs\gauntlet-${{ matrix.suite }}.log"
+          Write-Host "gauntlet $($args -join ' ')"
+          # Tee rather than redirect: the output still streams into the job log
+          # live, and the artifact gets a complete copy so a failure can be
+          # analysed without the run page. $LASTEXITCODE survives the pipeline
+          # because the native command sets it regardless.
+          "gauntlet $($args -join ' ')" | Out-File $log -Encoding utf8
+          # The provider deliberately triggers caught Rust panics in some suites,
+          # and those messages go to stderr. GitHub's pwsh shell runs with
+          # $ErrorActionPreference = 'Stop', so merging stderr into the pipeline
+          # unguarded would abort the step on the first one - which is exactly
+          # the output we most want to keep. Drop to Continue for the call and
+          # stringify each record so Tee-Object receives plain text.
+          $ErrorActionPreference = 'Continue'
+          & "$env:GITHUB_WORKSPACE\bin\gauntlet.exe" @args 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -FilePath $log -Append
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          exit $code
+
+      - name: Check the Windows event log for crash events
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          # A suite child that faults produces an Application Error entry even
+          # though the supervisor survives, so the event log is the independent
+          # confirmation that the exit-code classification was right.
+          $since = [datetime]::Parse($env:RUN_START)
+          $events = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since } -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -in @('Application Error', 'Windows Error Reporting') -and $_.Message -match 'gauntlet' }
+          if ($events) {
+            foreach ($e in $events) {
+              Write-Host "======== $($e.ProviderName) event $($e.Id) @ $($e.TimeCreated) ========"
+              Write-Host $e.Message
+            }
+          } else {
+            Write-Host 'No Application Error / WER events for gauntlet.exe during this run.'
+          }
+          # Keep a copy in the artifact so the crash evidence travels with the logs.
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          $evLog = "$env:GITHUB_WORKSPACE\logs\event-log.txt"
+          if ($events) {
+            $events | Format-List TimeCreated, ProviderName, Id, Message | Out-File $evLog -Encoding utf8
+          } else {
+            'No Application Error / WER events for gauntlet.exe during this run.' | Out-File $evLog -Encoding utf8
+          }
+          exit 0
+
+      - name: Analyze crash dumps with cdb
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          $dumps = Get-ChildItem "$env:GITHUB_WORKSPACE\dumps" -Filter *.dmp -ErrorAction SilentlyContinue
+          if (-not $dumps) { Write-Host 'No crash dumps were produced.'; exit 0 }
+          $cdb = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if (-not (Test-Path $cdb)) { Write-Host 'cdb.exe not found; dumps uploaded unanalyzed.'; exit 0 }
+          $env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbols;$env:GITHUB_WORKSPACE\bin"
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          foreach ($d in ($dumps | Select-Object -First 4)) {
+            Write-Host "================ $($d.Name) ================"
+            # Full analysis to the artifact, a readable head to the job log.
+            $txt = "$env:GITHUB_WORKSPACE\logs\cdb-$($d.BaseName).txt"
+            & $cdb -z $d.FullName -c '!analyze -v; lmv; ~*k 40; q' 2>&1 | Out-File $txt -Encoding utf8
+            Get-Content $txt | Select-Object -First 200 | Write-Host
+          }
+          exit 0
+
+      - name: Upload logs
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-x64-${{ matrix.suite }}
+          path: |
+            logs/**
+            dumps/*.dmp
+            gauntlet-work/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fail the job if the suite failed
+        if: always() && steps.gate.outputs.run == 'true' && steps.run.outcome != 'success'
+        run: |
+          Write-Host 'Suite ${{ matrix.suite }} did not pass. See the suite output above for the '
+          Write-Host 'per-check breakdown, the last case in flight if it crashed or hung, and the '
+          Write-Host 'exact command to replay it locally.'
+          exit 1
+
+  # ---------------------------------------------------------------
+  # Architecture coverage.
+  #
+  # The x64 matrix above splits by suite so a failure points at one suite's job.
+  # These lanes instead run every suite in a single job per architecture, because
+  # the question here is "does this build behave the same everywhere", not "which
+  # suite failed" - and the supervisor already isolates each suite in its own
+  # child process with its own watchdog, so one crashing suite still leaves the
+  # rest of the lane's results intact.
+  arch:
+    name: ${{ matrix.lane }}
+    needs: [build, corpus]
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 32-bit provider on a 64-bit host, under WOW64. This is what the x64
+          # MSI installs for 32-bit applications, and it is the configuration
+          # where usize is 32 bits - so the overflow guards around pitch and
+          # buffer-size arithmetic in the bitmap copy are load-bearing here and
+          # nowhere else.
+          - lane: x86 (WOW64)
+            arch: x86
+            runs-on: windows-latest
+          # Native ARM64 on ARM hardware.
+          - lane: arm64 (native)
+            arch: arm64
+            runs-on: windows-11-arm
+          # The x64 binaries on an ARM host, i.e. running under Windows'
+          # x64-on-ARM emulation. This is a real end-user configuration - an ARM
+          # PC running a 64-bit x86 shell host - and it exercises the emulator's
+          # handling of the D2D/WARP path rather than any new provider code.
+          - lane: x64 on ARM (emulated)
+            arch: x64
+            runs-on: windows-11-arm
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: bin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: svg-corpus
+          path: svg-corpus
+
+      - name: Report host and binary architecture
+        id: hostinfo
+        run: |
+          # Worth recording explicitly: on the emulated lane the host is ARM64
+          # and the process is x64, and that mismatch is the entire point.
+          Write-Host "host processor architecture : $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "host identifier             : $env:PROCESSOR_IDENTIFIER"
+          Write-Host "lane                        : ${{ matrix.lane }}"
+          $dllName = (Get-Content bin/dll-name.txt -Raw).Trim()
+          Write-Host "provider DLL                : $dllName"
+          "dll_name=$dllName" >> $env:GITHUB_OUTPUT
+
+      - name: Enable WER LocalDumps for the gauntlet process
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dumps" | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\gauntlet.exe" /v DumpType /t REG_DWORD /d 2 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\gauntlet.exe" /v DumpCount /t REG_DWORD /d 10 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\gauntlet.exe" /v DumpFolder /t REG_EXPAND_SZ /d "$env:GITHUB_WORKSPACE\dumps" /f
+
+      - name: Record run start
+        run: "\"RUN_START=$(Get-Date -Format o)\" >> $env:GITHUB_ENV"
+
+      - name: Run every suite
+        id: run
+        continue-on-error: true
+        run: |
+          $seed = '${{ inputs.seed }}'.Trim()
+          $scale = '${{ inputs.scale }}'.Trim()
+          if (-not $scale) { $scale = '1' }
+          $args = @('run',
+                    '--dll', "$env:GITHUB_WORKSPACE\bin\${{ steps.hostinfo.outputs.dll_name }}",
+                    '--scale', $scale,
+                    '--corpus', "$env:GITHUB_WORKSPACE\svg-corpus",
+                    '--work-dir', "$env:GITHUB_WORKSPACE\gauntlet-work")
+          if ($seed) { $args += @('--seed', $seed) }
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          $log = "$env:GITHUB_WORKSPACE\logs\gauntlet-${{ matrix.arch }}-on-${{ matrix.runs-on }}.log"
+          Write-Host "gauntlet $($args -join ' ')"
+          "lane: ${{ matrix.lane }}" | Out-File $log -Encoding utf8
+          "host: $env:PROCESSOR_ARCHITECTURE ($env:PROCESSOR_IDENTIFIER)" | Out-File $log -Append -Encoding utf8
+          "gauntlet $($args -join ' ')" | Out-File $log -Append -Encoding utf8
+          # The provider deliberately triggers caught Rust panics in some suites,
+          # and those messages go to stderr. GitHub's pwsh shell runs with
+          # $ErrorActionPreference = 'Stop', so merging stderr into the pipeline
+          # unguarded would abort the step on the first one - which is exactly
+          # the output we most want to keep. Drop to Continue for the call and
+          # stringify each record so Tee-Object receives plain text.
+          $ErrorActionPreference = 'Continue'
+          & "$env:GITHUB_WORKSPACE\bin\gauntlet.exe" @args 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -FilePath $log -Append
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          exit $code
+
+      - name: Check the Windows event log for crash events
+        if: always()
+        run: |
+          $since = [datetime]::Parse($env:RUN_START)
+          $events = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since } -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -in @('Application Error', 'Windows Error Reporting') -and $_.Message -match 'gauntlet' }
+          if ($events) {
+            foreach ($e in $events) {
+              Write-Host "======== $($e.ProviderName) event $($e.Id) @ $($e.TimeCreated) ========"
+              Write-Host $e.Message
+            }
+          } else {
+            Write-Host 'No Application Error / WER events for gauntlet.exe during this run.'
+          }
+          # Keep a copy in the artifact so the crash evidence travels with the logs.
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          $evLog = "$env:GITHUB_WORKSPACE\logs\event-log.txt"
+          if ($events) {
+            $events | Format-List TimeCreated, ProviderName, Id, Message | Out-File $evLog -Encoding utf8
+          } else {
+            'No Application Error / WER events for gauntlet.exe during this run.' | Out-File $evLog -Encoding utf8
+          }
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.arch }}-on-${{ matrix.runs-on }}
+          path: |
+            logs/**
+            dumps/*.dmp
+            gauntlet-work/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fail the job if any suite failed
+        if: always() && steps.run.outcome != 'success'
+        run: |
+          Write-Host 'Lane ${{ matrix.lane }} did not pass. The gauntlet summary above lists which '
+          Write-Host 'suites failed, the last case in flight for any crash or hang, and a replay command.'
+          exit 1
+
+  # ---------------------------------------------------------------
+  # One artifact instead of thirteen. Each lane uploads its own logs (matrix
+  # jobs cannot append to a shared artifact), and this merges them and deletes
+  # the parts, so a run leaves a single `gauntlet-logs` zip containing every
+  # suite's full output, the event-log query, any crash dumps and their cdb
+  # analysis - enough to diagnose a failure without opening the run page.
+  collect-logs:
+    name: Collect logs
+    needs: [gauntlet, arch]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/upload-artifact/merge@v7
+        continue-on-error: true
+        with:
+          name: gauntlet-logs
+          pattern: logs-*
+          delete-merged: true
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  verdict:
+    name: Gauntlet verdict
+    needs: [gauntlet, arch]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Summarize
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          summary() { echo "$@" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # Per-job results come from the run itself rather than from a pile of
+          # single-word artifacts. Each suite already appended its own failing
+          # checks to the run summary from inside its job; this is the index.
+          jobs_json="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+            --jq '.jobs[] | select(.name | test("^(x64 / |x86 |arm64 |x64 on ARM)")) | [.name, .conclusion] | @tsv' \
+            || true)"
+
+          summary "## Gauntlet result"
+          summary ""
+          summary "| Lane / suite | Result |"
+          summary "|---|---|"
+          failed=0
+          ran=0
+          while IFS=$'\t' read -r name conclusion; do
+            [ -n "$name" ] || continue
+            ran=$((ran + 1))
+            case "$conclusion" in
+              success) icon="pass" ;;
+              skipped) icon="skipped"; ran=$((ran - 1)) ;;
+              *)       icon="**FAIL**"; failed=$((failed + 1)) ;;
+            esac
+            summary "| \`$name\` | $icon |"
+            echo "$name: $conclusion"
+          done <<< "$jobs_json"
+
+          summary ""
+          if [ "$ran" -eq 0 ]; then
+            summary "No suites ran - treat this as a failure, not a pass."
+            exit 1
+          fi
+          if [ "$failed" -gt 0 ]; then
+            summary "**$failed of $ran failed.** The failing checks and their measured values are listed per suite above; the full logs are in the \`gauntlet-logs\` artifact."
+            exit 1
+          fi
+          summary "All $ran lanes and suites passed."
+
+      # Belt and braces: if the API listing above ever came back empty, the
+      # matrix results themselves still gate the run.
+      - name: Gate on the matrix results
+        # always(), or a failing Summarize skips this and the backstop never
+        # runs - which defeats the point of having one.
+        if: always() && (needs.gauntlet.result != 'success' || needs.arch.result != 'success')
+        run: |
+          echo "gauntlet matrix: ${{ needs.gauntlet.result }}"
+          echo "arch matrix    : ${{ needs.arch.result }}"
+          exit 1
