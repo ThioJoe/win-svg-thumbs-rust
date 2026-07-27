@@ -1,0 +1,206 @@
+# Reproduces (and, once fixed, guards against) the dllhost.exe crash caused by
+# unloading the DLL, or exiting a thread, while that thread's TLS still caches
+# live Direct2D-on-WARP graphics state (see unload-harness/src/main.rs).
+#
+# Verdict semantics:
+#   RED "CRASH REPRODUCED"  = a hazardous variant crashed or hung (bug present).
+#   RED "INCONCLUSIVE"      = the harness could not create/exercise the hazardous
+#                             state (setup, precondition or environment failure);
+#                             NOT proof of the bug either way.
+#   GREEN                   = rendering verified real (pixel-checked) and every
+#                             variant survived.
+#
+# Manual dispatch with unfixed=true reverts src/lib.rs to the pre-fix version to
+# demonstrate the reproduction on demand.
+name: unload-crash-repro
+
+on:
+  push:
+    branches:
+      - master
+      - 'claude/**'
+    paths:
+      - 'src/**'
+      - 'unload-harness/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/unload-crash-repro.yml'
+      - '.github/scripts/run-harness.ps1'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'unload-harness/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/unload-crash-repro.yml'
+      - '.github/scripts/run-harness.ps1'
+  workflow_dispatch:
+    inputs:
+      unfixed:
+        description: 'Revert src/lib.rs to the pre-fix version to demonstrate the crash repro'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Revert fix (repro demonstration mode)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.unfixed }}
+        run: |
+          git checkout 434d231f592a4a9868af3640542d169df62d175e -- src/lib.rs
+          Write-Host 'src/lib.rs reverted to pre-fix commit 434d231; this run is EXPECTED to go red with CRASH REPRODUCED.'
+
+      - name: Toolchain and build info
+        run: |
+          rustc -Vv
+          cargo -V
+
+      - name: Build DLL (release)
+        run: cargo build --release -p win_svg_thumbs
+
+      - name: Build harness (debug)
+        run: cargo build -p unload_harness
+
+      - name: Enable WER LocalDumps and record DLL hash
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dumps" | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\unload_harness.exe" /v DumpType /t REG_DWORD /d 2 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\unload_harness.exe" /v DumpCount /t REG_DWORD /d 10 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\unload_harness.exe" /v DumpFolder /t REG_EXPAND_SZ /d "$env:GITHUB_WORKSPACE\dumps" /f
+          Get-FileHash target/release/win_svg_thumbs_x64.dll -Algorithm SHA256 | Format-List
+
+      - name: 'Control: render repeatedly, never unload, never exit a caching thread'
+        id: control
+        run: ./.github/scripts/run-harness.ps1 -Mode control -Iterations 50 -TimeoutSec 300
+
+      - name: 'Variant B: worker thread exits while DLL stays loaded'
+        id: threadexit
+        continue-on-error: true
+        run: ./.github/scripts/run-harness.ps1 -Mode threadexit -Iterations 50 -TimeoutSec 300
+
+      - name: 'Variant C: ExitProcess while TLS caches are live (main thread + parked worker)'
+        id: processexit
+        continue-on-error: true
+        run: ./.github/scripts/run-harness.ps1 -Mode processexit -Iterations 1 -TimeoutSec 120 -Repeats 10
+
+      - name: 'Variant A: FreeLibrary after rendering on another thread (theorized crash site)'
+        id: freelibrary
+        continue-on-error: true
+        run: ./.github/scripts/run-harness.ps1 -Mode freelibrary -Iterations 50 -TimeoutSec 300
+
+      - name: Check Windows Event Log for crash events (Event Viewer evidence)
+        id: eventlog
+        if: always()
+        run: |
+          # The user-facing symptom is an Application Error (Event 1000) entry in
+          # Event Viewer with KERNELBASE.dll as the faulting module. Query the
+          # VM's Application log for crash events belonging to the harness and
+          # surface them verbatim, so a reproduction is confirmed against the
+          # same observable as the original report.
+          $appErrors = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000 } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'unload_harness\.exe' }
+          $werReports = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Windows Error Reporting'; Id = 1001 } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'unload_harness' }
+          $kb = $false
+          foreach ($e in $appErrors) {
+            Write-Host "================ Application Error (Event 1000) @ $($e.TimeCreated) ================"
+            Write-Host $e.Message
+            if ($e.Message -match '(?i)kernelbase\.dll|kernel32\.dll') { $kb = $true }
+          }
+          foreach ($e in $werReports) {
+            Write-Host "================ Windows Error Reporting (Event 1001) @ $($e.TimeCreated) ================"
+            Write-Host $e.Message
+          }
+          $found = [bool]($appErrors -or $werReports)
+          if (-not $found) {
+            Write-Host 'No Application Error (1000) or WER (1001) events for unload_harness.exe in the event log.'
+          }
+          "found=$($found.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "kernelbase=$($kb.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Analyze crash dumps with cdb (if available)
+        if: always()
+        run: |
+          $dumps = Get-ChildItem "$env:GITHUB_WORKSPACE\dumps" -Filter *.dmp -ErrorAction SilentlyContinue
+          if (-not $dumps) { Write-Host 'No crash dumps were produced.'; exit 0 }
+          $cdb = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if (-not (Test-Path $cdb)) { Write-Host "cdb.exe not found at '$cdb' - dumps are only uploaded as artifacts."; exit 0 }
+          $env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbols;$env:GITHUB_WORKSPACE\target\release;$env:GITHUB_WORKSPACE\target\debug"
+          foreach ($d in $dumps) {
+            Write-Host "================ $($d.Name) ================"
+            & $cdb -z $d.FullName -c '!analyze -v; ~*k 40; q'
+          }
+          exit 0
+
+      - name: Upload diagnostics (dumps, harness logs, PDBs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: |
+            dumps/*.dmp
+            harness-*.log
+            target/release/win_svg_thumbs_x64.pdb
+            target/debug/unload_harness.pdb
+          if-no-files-found: ignore
+
+      - name: Verdict
+        if: always()
+        run: |
+          $control        = '${{ steps.control.outcome }}'
+          $controlVerdict = '${{ steps.control.outputs.verdict }}'
+          $results = [ordered]@{
+            threadexit  = @{ outcome = '${{ steps.threadexit.outcome }}';  verdict = '${{ steps.threadexit.outputs.verdict }}' }
+            processexit = @{ outcome = '${{ steps.processexit.outcome }}'; verdict = '${{ steps.processexit.outputs.verdict }}' }
+            freelibrary = @{ outcome = '${{ steps.freelibrary.outcome }}'; verdict = '${{ steps.freelibrary.outputs.verdict }}' }
+          }
+          Write-Host ("control     : {0} ({1})" -f $control, $controlVerdict)
+          foreach ($k in $results.Keys) {
+            Write-Host ("{0,-12}: {1} ({2})" -f $k, $results[$k].outcome, $results[$k].verdict)
+          }
+          if ($control -ne 'success') {
+            Write-Host 'INCONCLUSIVE: the control variant failed, so the environment cannot exercise the bug and no other result is meaningful.'
+            exit 1
+          }
+          $repro = @(); $inconclusive = @()
+          foreach ($k in $results.Keys) {
+            $o = $results[$k].outcome; $v = $results[$k].verdict
+            if ($o -eq 'success') { continue }
+            if ($v -in @('crash', 'hang')) { $repro += "$k=$v" }
+            else { $inconclusive += "$k=$(if ($v) { $v } else { 'unknown' })" }
+          }
+          $evFound = '${{ steps.eventlog.outputs.found }}'
+          $evKb    = '${{ steps.eventlog.outputs.kernelbase }}'
+          if ($repro.Count -gt 0) {
+            Write-Host ('CRASH REPRODUCED in: ' + ($repro -join ', '))
+            if ($evKb -eq 'true') {
+              Write-Host 'EVENT VIEWER CONFIRMATION: the VM Application log contains Application Error event(s) for the harness with KERNELBASE.dll as the faulting module - the same signature as the original dllhost.exe reports.'
+            } elseif ($evFound -eq 'true') {
+              Write-Host 'Event Viewer recorded Application Error / WER event(s) for the harness (see the event log step above for the faulting module details).'
+            } else {
+              Write-Host 'No Event Viewer crash entry was recorded: a watchdog-killed loader-lock deadlock terminates without an exception, so WER never sees it.'
+            }
+            exit 1
+          }
+          if ($inconclusive.Count -gt 0) {
+            Write-Host ('INCONCLUSIVE (harness/precondition failures, NOT proof of the bug): ' + ($inconclusive -join ', '))
+            exit 1
+          }
+          Write-Host 'All variants survived: no crash.'

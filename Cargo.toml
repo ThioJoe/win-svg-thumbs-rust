@@ -2,6 +2,7 @@
 members = [
     ".",
     "Testing",
+    "unload-harness",
     # "win_svg_thumbs"
 ]
 

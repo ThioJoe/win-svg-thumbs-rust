@@ -1,0 +1,301 @@
+# Long-haul, real-path reproduction of the reported COM Surrogate crash:
+#   Faulting application: DllHost.exe
+#   Faulting module:      KERNELBASE.dll
+#   Exception code:       0x0000087a (DXGI facility)
+#   with win_svg_thumbs_x64.dll + d2d1/d3d11/dxgi loaded, during idle periods.
+#
+# Manually triggered only. Registers the DLL (unfixed by default) as the real
+# .svg thumbnail handler, forces WARP like the reporter's machine, then drives
+# genuine shell thumbnail extraction (IShellItemImageFactory / IThumbnailCache)
+# over a pinned Fluent Emoji SVG corpus in activity/idle cycles for ~5.5 hours,
+# leaving COM Surrogate lifecycle, idle cleanup and unloading entirely to
+# Windows. dllhost.exe is never killed and no outcome is simulated; evidence is
+# captured continuously (Application event log, WER, full dllhost dumps).
+#
+# Result classes reported by the Verdict step:
+#   1 EXACT CRASH REPRODUCED      dllhost.exe Event 1000 with exception 0x0000087a
+#   2 DIFFERENT CRASH REPRODUCED  a genuine crash event with another app/module/code
+#   3 CONFIRMED HANG/DEADLOCK     no progress + no exception recorded by Windows
+#   4 NOT REPRODUCED IN WINDOW    workload completed clean (NOT proof of absence)
+#   5 ENVIRONMENT MISMATCH        the runner cannot exercise the real shell path
+name: surrogate-longhaul
+
+on:
+  # The push trigger exists only to register this dispatch-only workflow with
+  # GitHub (a workflow with no runs cannot be dispatched by filename); the job
+  # guard below skips push-triggered runs instantly.
+  push:
+    branches:
+      - 'claude/**'
+    paths:
+      - '.github/workflows/surrogate-longhaul.yml'
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'DLL version to test'
+        type: choice
+        options: [unfixed, fixed]
+        default: unfixed
+      duration_minutes:
+        description: 'Workload duration in minutes (default 330 = 5h30m)'
+        type: string
+        default: '330'
+      files_per_burst:
+        description: 'SVG files per activity burst'
+        type: string
+        default: '120'
+      idle_pattern:
+        description: 'Idle minutes between bursts, cycled (comma separated)'
+        type: string
+        default: '6,12,18'
+      provider_debug_log:
+        description: 'Enable the provider debug log (extra evidence, but deviates from the reporter config)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: surrogate-longhaul
+  cancel-in-progress: false
+
+jobs:
+  longhaul:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select DLL version (unfixed = pre-fix src/lib.rs)
+        run: |
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          if ('${{ inputs.build }}' -eq 'unfixed') {
+            git checkout 434d231f592a4a9868af3640542d169df62d175e -- src/lib.rs
+            Write-Host 'Testing the KNOWN-UNFIXED DLL (src/lib.rs from pre-fix commit 434d231).'
+          } else {
+            Write-Host 'Testing the FIXED DLL (current branch src/lib.rs).'
+          }
+          "build_input=${{ inputs.build }}" | Out-File evidence/build-info.txt -Encoding utf8
+
+      - name: Build DLL (release) and driver
+        run: |
+          cargo build --release -p win_svg_thumbs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p unload_harness
+
+      - name: Record build commit, toolchain and binary hashes
+        run: |
+          rustc -Vv
+          $info = @()
+          $info += "workflow_commit=$(git rev-parse HEAD)"
+          $info += "lib_rs_blob=$(git hash-object src/lib.rs)"
+          $info += "build_input=${{ inputs.build }}"
+          $info += "dll_sha256=$((Get-FileHash target/release/win_svg_thumbs_x64.dll -Algorithm SHA256).Hash)"
+          $info += "driver_sha256=$((Get-FileHash target/debug/thumb_driver.exe -Algorithm SHA256).Hash)"
+          $info += "rustc=$(rustc -V)"
+          $info += "started=$(Get-Date -Format o)"
+          $info | Tee-Object evidence/build-info.txt -Append | Write-Host
+          "RUN_START=$(Get-Date -Format o)" >> $env:GITHUB_ENV
+
+      - name: Fetch pinned Fluent Emoji SVG corpus and write manifest
+        run: |
+          $sha = '62ecdc0d7ca5c6df32148c169556bc8d3782fca4'
+          git clone --filter=blob:none --no-checkout https://github.com/microsoft/fluentui-emoji.git fluent
+          Push-Location fluent
+          git sparse-checkout init --no-cone
+          git sparse-checkout set 'assets/*/Color/*.svg'
+          git checkout $sha
+          Pop-Location
+          $all = Get-ChildItem fluent/assets -Recurse -Filter *.svg | Where-Object { $_.DirectoryName -match '\\Color$' } | Sort-Object Length
+          Write-Host "fetched $($all.Count) Color SVGs from fluentui-emoji@$sha"
+          if ($all.Count -lt 100) { throw "too few SVGs fetched ($($all.Count)); cannot build a varied corpus" }
+          $n = [Math]::Min(400, $all.Count)
+          $third = [int]($n / 3)
+          $sel = @()
+          $sel += $all | Select-Object -First $third
+          $sel += $all | Select-Object -Skip ([int](($all.Count - $third) / 2)) -First $third
+          $sel += $all | Select-Object -Last ($n - 2 * $third)
+          New-Item -ItemType Directory -Force -Path svg-corpus | Out-Null
+          $manifest = @("# microsoft/fluentui-emoji @ $sha", 'name,repo_path,bytes,sha256')
+          $i = 0
+          $fluentRoot = (Resolve-Path fluent).Path
+          foreach ($f in $sel) {
+            $emoji = ($f.Directory.Parent.Name -replace '[^A-Za-z0-9_-]', '_')
+            $name = '{0:d4}_{1}_{2}' -f $i, $emoji, ($f.Name -replace '[^A-Za-z0-9._-]', '_')
+            Copy-Item $f.FullName (Join-Path svg-corpus $name)
+            $rel = $f.FullName.Substring($fluentRoot.Length + 1) -replace '\\', '/'
+            $manifest += "$name,$rel,$($f.Length),$((Get-FileHash $f.FullName -Algorithm SHA256).Hash)"
+            $i++
+          }
+          $manifest | Out-File evidence/svg-manifest.csv -Encoding utf8
+          Write-Host "corpus: $i SVGs, sizes $($sel[0].Length)..$($sel[-1].Length) bytes (small/medium/large strata)"
+
+      - name: Register provider (real shell registration), force WARP, enable provider debug log
+        run: |
+          # regsvr32 is a GUI-subsystem exe: run it synchronously and read its
+          # real exit code (it never sets $LASTEXITCODE).
+          $dll = (Resolve-Path target\release\win_svg_thumbs_x64.dll).Path
+          $p = Start-Process regsvr32 -ArgumentList '/s', $dll -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "regsvr32 failed with exit code $($p.ExitCode)" }
+          reg add "HKCR\.svg" /v win_svg_thumbs_use_hardware /t REG_DWORD /d 0 /f
+          if ('${{ inputs.provider_debug_log }}' -eq 'true') {
+            reg add "HKCR\.svg" /v win_svg_thumbs_enable_debug_log /t REG_DWORD /d 1 /f
+          } else {
+            Write-Host 'provider debug log left DISABLED (matches the reporter configuration)'
+          }
+          Write-Host '--- registration check ---'
+          reg query "HKCR\CLSID\{A884A812-58FD-47D5-BDA6-4FAB4FABDCD9}\InprocServer32"
+          reg query "HKCR\.svg\shellex\{E357FCCD-A995-4576-B01F-234630154E96}"
+
+      - name: Enable WER LocalDumps for dllhost.exe and the driver (full dumps)
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dumps" | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f
+          foreach ($exe in @('dllhost.exe', 'thumb_driver.exe')) {
+            reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$exe" /v DumpType /t REG_DWORD /d 2 /f
+            reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$exe" /v DumpCount /t REG_DWORD /d 3 /f
+            reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$exe" /v DumpFolder /t REG_EXPAND_SZ /d "$env:GITHUB_WORKSPACE\dumps" /f
+          }
+
+      - name: 'Workload: real thumbnail activity + genuine idle cycles (no watchdog on dllhost)'
+        continue-on-error: true
+        run: ./.github/scripts/surrogate-longhaul.ps1 -DurationMinutes ([int]'${{ inputs.duration_minutes }}') -FilesPerBurst ([int]'${{ inputs.files_per_burst }}') -IdlePattern '${{ inputs.idle_pattern }}'
+
+      - name: Export and print Application event log evidence
+        if: always()
+        run: |
+          wevtutil epl Application evidence\application.evtx
+          $since = [datetime]::Parse($env:RUN_START)
+          $events = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since } -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -in @('Application Error', 'Windows Error Reporting') }
+          $outLines = @()
+          foreach ($e in ($events | Sort-Object RecordId)) {
+            $outLines += "======== COMPLETE EVENT (RecordId $($e.RecordId)) ========"
+            $outLines += ($e | Format-List RecordId, Id, TimeCreated, ProviderName, LevelDisplayName, MachineName, UserId | Out-String)
+            $outLines += 'Message:'
+            $outLines += $e.Message
+            $outLines += ''
+          }
+          if (-not $outLines) { $outLines = @('No Application Error / WER events were recorded during the run window.') }
+          $outLines | Tee-Object evidence\event-log-full.txt | Write-Host
+
+      - name: Collect WER Report.wer files and provider debug log
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path evidence\wer | Out-Null
+          foreach ($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue")) {
+            Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match 'dllhost|thumb_driver|unload_harness' } |
+              ForEach-Object { Copy-Item $_.FullName -Destination (Join-Path evidence\wer $_.Name) -Recurse -Force }
+          }
+          Get-ChildItem evidence\wer -Recurse -Filter Report.wer -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "---------- $($_.FullName) ----------"
+            Get-Content $_.FullName -ErrorAction SilentlyContinue | Select-Object -First 100 | Write-Host
+          }
+          $dbg = Join-Path $env:USERPROFILE 'Desktop\win_svg_thumb_debug_log.txt'
+          if (Test-Path $dbg) {
+            Copy-Item $dbg evidence\
+            Write-Host "provider debug log captured ($((Get-Item $dbg).Length) bytes); last lines:"
+            Get-Content $dbg | Select-Object -Last 40 | Write-Host
+          } else { Write-Host 'no provider debug log found (provider may never have rendered)' }
+
+      - name: Analyze dumps with cdb (loaded modules + all thread stacks)
+        if: always()
+        run: |
+          $dumps = Get-ChildItem "$env:GITHUB_WORKSPACE\dumps" -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+          if (-not $dumps) { Write-Host 'No dumps were produced.'; exit 0 }
+          $cdb = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if (-not (Test-Path $cdb)) { Write-Host 'cdb.exe not found; dumps uploaded unanalyzed.'; exit 0 }
+          New-Item -ItemType Directory -Force -Path evidence\cdb | Out-Null
+          $env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbols;$env:GITHUB_WORKSPACE\target\release;$env:GITHUB_WORKSPACE\target\debug"
+          foreach ($d in ($dumps | Select-Object -First 4)) {
+            Write-Host "================ analyzing $($d.Name) ================"
+            $txt = Join-Path evidence\cdb "$($d.BaseName).txt"
+            & $cdb -z $d.FullName -c '!analyze -v; lmv; ~*k 50; q' 2>&1 | Out-File $txt -Encoding utf8
+            Get-Content $txt | Select-Object -First 220 | Write-Host
+            Write-Host "(full analysis in artifact: evidence/cdb/$($d.BaseName).txt)"
+          }
+          exit 0
+
+      - name: Verdict (5-class result)
+        if: always()
+        run: |
+          $ev = 'evidence'
+          $eventsTxt = ''
+          if (Test-Path "$ev\crash-events.txt") { $eventsTxt = Get-Content "$ev\crash-events.txt" -Raw }
+          if (Test-Path "$ev\crash-events.txt") {
+            Write-Host '=========== ALL EVENTS CAPTURED DURING WORKLOAD (complete) ==========='
+            Get-Content "$ev\crash-events.txt" | Write-Host
+          }
+          $hosted   = Test-Path "$ev\surrogate-hosted.flag"
+          $crash    = Test-Path "$ev\crash-detected.flag"
+          $hang     = Test-Path "$ev\hang-detected.flag"
+          $envBad   = (Test-Path "$ev\environment-mismatch.flag") -or (Test-Path "$ev\inproc-contamination.flag")
+          # Per-event classification: application AND exception code must appear
+          # in the SAME Event 1000 message, so unrelated events cannot combine
+          # into a false "exact" and unrelated processes are reported separately.
+          $since = [datetime]::Parse($env:RUN_START)
+          $appErrors = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = $since } -ErrorAction SilentlyContinue)
+          # Three buckets, judged per event:
+          #   exact     = DllHost.exe AND 0x0000087a in the same event (class 1)
+          #   project   = dllhost with a different code, or our own driver/harness
+          #               crashing (class 2)
+          #   unrelated = any other application: reported as runner noise only,
+          #               never counted as a reproduction
+          $exactEvents = @(); $projectCrashEvents = @(); $unrelatedCrashEvents = @()
+          foreach ($e in $appErrors) {
+            $isDllhost = $e.Message -match '(?i)Faulting application name:\s*DllHost\.exe'
+            $isOurs    = $e.Message -match '(?i)Faulting application name:\s*(thumb_driver|unload_harness)\.exe'
+            $is87a     = $e.Message -match '(?i)Exception code:\s*0x0000087a'
+            if ($isDllhost -and $is87a) { $exactEvents += $e }
+            elseif ($isDllhost -or $isOurs) { $projectCrashEvents += $e }
+            else { $unrelatedCrashEvents += $e }
+          }
+          $describe = {
+            param($e)
+            $app = if ($e.Message -match '(?i)Faulting application name:\s*([^,]+)') { $Matches[1] } else { '?' }
+            $code = if ($e.Message -match '(?i)Exception code:\s*(0x[0-9a-fA-F]+)') { $Matches[1] } else { '?' }
+            "RecordId=$($e.RecordId) app=$app code=$code at $($e.TimeCreated)"
+          }
+          foreach ($e in $exactEvents) { Write-Host "exact-signature event: $(& $describe $e)" }
+          foreach ($e in $projectCrashEvents) { Write-Host "project crash event (non-exact): $(& $describe $e)" }
+          foreach ($e in $unrelatedCrashEvents) { Write-Host "unrelated runner noise (NOT counted as reproduction): $(& $describe $e)" }
+          $exact = $exactEvents.Count -gt 0
+          $anyCrashEvent = $projectCrashEvents.Count -gt 0
+          Write-Host "flags: surrogateHosted=$hosted crashEvent=$crash hangDetected=$hang envProblem=$envBad exactEvents=$($exactEvents.Count) projectCrashEvents=$($projectCrashEvents.Count) unrelatedCrashEvents=$($unrelatedCrashEvents.Count)"
+          Write-Host "build tested: ${{ inputs.build }}"
+          if (Test-Path "$ev\workload-summary.txt") { Get-Content "$ev\workload-summary.txt" | Write-Host }
+          if ($envBad -or (-not $hosted)) {
+            Write-Host 'CLASS 5 - ENVIRONMENT MISMATCH / INCONCLUSIVE: the runner could not exercise the real shell -> dllhost.exe thumbnail path (or the provider was never hosted in dllhost.exe). No conclusion about the bug.'
+            exit 1
+          }
+          if ($exact) {
+            Write-Host "CLASS 1 - EXACT CRASH REPRODUCED: Windows recorded $($exactEvents.Count) natural dllhost.exe crash event(s) with exception 0x0000087a in a single event each (complete events above; dumps in artifacts)."
+            exit 1
+          }
+          if ($anyCrashEvent) {
+            Write-Host "CLASS 2 - DIFFERENT CRASH REPRODUCED: Windows recorded $($projectCrashEvents.Count) genuine crash event(s) of dllhost.exe or the test driver, but with a different exception/module than the original signature. Complete events above. (Unrelated-application crashes, if any, are listed as runner noise and were not counted.)"
+            exit 1
+          }
+          if ($hang) {
+            Write-Host 'CLASS 3 - CONFIRMED HANG/DEADLOCK: thumbnail extraction stopped making progress but Windows recorded no exception. Useful evidence, not the exact original exception. Passive dumps are in artifacts.'
+            exit 1
+          }
+          Write-Host 'CLASS 4 - NOT REPRODUCED WITHIN THE TEST WINDOW: the workload completed without a crash, hang, or environment problem. This does NOT prove the bug is absent; consider additional or longer runs.'
+          exit 0
+
+      - name: Upload evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surrogate-longhaul-${{ inputs.build }}-evidence
+          path: |
+            evidence/**
+            dumps/*.dmp
+            target/release/win_svg_thumbs_x64.pdb
+            target/debug/thumb_driver.pdb
+          if-no-files-found: warn
