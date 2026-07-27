@@ -1071,17 +1071,12 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
         Ok(hbitmap_guard.release())
     })();
 
-    // Check if the closure returned an error, and if that error was due to a lost device.
-    // Set the poisoned flag if so, to force recreation of resources next time.
+    // Device-loss errors mean the cached D2D/D3D chain can no longer be used.
+    // Mark it poisoned so the next render recreates it on this thread, outside the loader lock.
     if let Err(e) = &result {
-        if e.code() == D2DERR_RECREATE_TARGET {
-            debug_log!("render_svg_to_hbitmap: D2D device lost, marking resources as poisoned for recreation");
-            RESOURCES.with(|resources| {
-                let mut resources_ref = resources.borrow_mut();
-                if let Some(ref mut res) = *resources_ref {
-                    res.poisoned = true;
-                }
-            });
+        if is_graphics_device_lost(e.code()) {
+            debug_log!( "render_svg_to_hbitmap: Graphics device lost ({:?}), marking resources as poisoned for recreation", e.code() );
+            mark_thread_resources_poisoned();
         } else {
             debug_log!("render_svg_to_hbitmap: Error occurred: {:?}", e);
         }
@@ -1090,6 +1085,29 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
     result
 }
 
+fn mark_thread_resources_poisoned() {
+    RESOURCES.with(|resources| {
+        match resources.try_borrow_mut() {
+            Ok(mut resources_ref) => {
+                if let Some(resources) = resources_ref.as_mut() {
+                    resources.poisoned = true;
+                }
+            }
+            Err(_) => {
+                debug_log!( "mark_thread_resources_poisoned: Could not borrow thread resources" );
+            }
+        }
+    });
+}
+
+/// Returns true when the cached D2D/D3D device must be discarded and recreated.
+fn is_graphics_device_lost(code: HRESULT) -> bool {
+    code == D2DERR_RECREATE_TARGET
+        || code == Dxgi::DXGI_ERROR_DEVICE_REMOVED
+        || code == Dxgi::DXGI_ERROR_DEVICE_HUNG
+        || code == Dxgi::DXGI_ERROR_DEVICE_RESET
+        || code == Dxgi::DXGI_ERROR_DRIVER_INTERNAL_ERROR
+}
 // =================================================================
 //                 COM Thumbnail Provider Object
 // =================================================================
@@ -1231,7 +1249,16 @@ impl Shell::IThumbnailProvider_Impl for ThumbnailProvider_Impl {
                 }
             }; // Mutex lock is released here
 
-            match render_svg_to_hbitmap(&svg_data[..], cx, cx) {
+            // First attempt. On device-lost, resources are marked poisoned; retry once so a transient DXGI/D2D reset does not immediately fall back.
+            let mut render_result = render_svg_to_hbitmap(&svg_data[..], cx, cx);
+            if let Err(ref e) = render_result {
+                if is_graphics_device_lost(e.code()) {
+                    debug_log!( "GetThumbnail: retrying once after graphics device loss ({:?})", e.code() );
+                    render_result = render_svg_to_hbitmap(&svg_data[..], cx, cx);
+                }
+            }
+
+            match render_result {
                 Ok(hbitmap) => {
                     // log_message("GetThumbnail: render_svg_to_hbitmap succeeded.");
                     unsafe {
