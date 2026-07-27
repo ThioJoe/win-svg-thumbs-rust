@@ -4,7 +4,7 @@
 #   Exception code:       0x0000087a (DXGI facility)
 #   with win_svg_thumbs_x64.dll + d2d1/d3d11/dxgi loaded, during idle periods.
 #
-# Manually triggered only. Registers the DLL (unfixed by default) as the real
+# Manually triggered only. Registers the DLL (latest or known unfixed) as the real
 # .svg thumbnail handler, forces WARP like the reporter's machine, then drives
 # genuine shell thumbnail extraction (IShellItemImageFactory / IThumbnailCache)
 # over a pinned Fluent Emoji SVG corpus in activity/idle cycles for ~5.5 hours,
@@ -34,8 +34,8 @@ on:
       build:
         description: 'DLL version to test'
         type: choice
-        options: [unfixed, fixed]
-        default: unfixed
+        options: [latest, unfixed]
+        default: latest
       duration_minutes:
         description: 'Workload duration in minutes (default 330 = 5h30m)'
         type: string
