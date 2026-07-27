@@ -4,6 +4,7 @@ use std::{
     ffi::OsStr,
     // fs::OpenOptions,
     io::Write,
+    mem::ManuallyDrop,
     os::windows::prelude::OsStrExt,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
@@ -226,8 +227,59 @@ struct ThreadResources {
     _com_guard: ComGuard,
 }
 
+// SAFETY-CRITICAL: The cache is wrapped in ManuallyDrop so that a thread's cached
+// D2D/D3D-WARP chain is never torn down by Rust's TLS destructor machinery. TLS
+// destructors run inside a PE TLS callback during DLL_THREAD_DETACH and
+// DLL_PROCESS_DETACH, i.e. while the OS loader lock is held. Releasing the last
+// reference to a WARP-backed D3D11 device there can deadlock (device teardown waits on
+// its worker threads, which themselves need the loader lock to exit) or crash the host
+// process. Instead:
+//   - Resources are explicitly dropped (ManuallyDrop::into_inner) only when they are
+//     intentionally replaced during normal rendering (device-lost/poisoned path), which
+//     runs on the owning thread outside the loader lock.
+//   - When a thread exits, its cached resources are deliberately leaked (no destructor
+//     is even registered, since the TLS payload no longer needs drop). Threads that
+//     render thumbnails are shell/surrogate pool threads that in practice live until
+//     process exit, so nothing meaningful accumulates.
+//   - After a caught panic, ffi_guard clears the slot without dropping - leaking is the
+//     safest option when the resources are in an unknown state.
+//   - pin_module_in_memory() below guarantees the DLL (and its d2d1/d3d11/dxgi imports)
+//     is never unmapped while leaked or live caches exist.
 thread_local! {
-    static RESOURCES: RefCell<Option<ThreadResources>> = RefCell::new(None);
+    static RESOURCES: RefCell<Option<ManuallyDrop<ThreadResources>>> = RefCell::new(None);
+}
+
+// Tracks whether the DLL is already pinned; pinning is idempotent, this only avoids a redundant syscall.
+static MODULE_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pins this DLL in memory for the lifetime of the process. Called right before the
+/// first per-thread D2D cache is created (a normal call context, never DllMain, so
+/// briefly taking the loader lock inside GetModuleHandleExW is safe).
+///
+/// Why: DllCanUnloadNow only counts live COM objects and server locks, so once the
+/// shell releases its last thumbnail object, COM may FreeLibrary this DLL even though
+/// per-thread caches still own a live D2D-on-WARP device chain. Unmapping the DLL then
+/// pulls d2d1/d3d11/dxgi/d3d10warp out from under that live state - and from under
+/// WARP's running worker threads - which crashes or deadlocks the host (observed as
+/// dllhost.exe crashes during idle periods). Once any thread has cached graphics
+/// state, staying loaded is the only safe option; the surrogate process still exits on
+/// idle, which is when the DLL actually gets released.
+fn pin_module_in_memory() -> Result<()> {
+    if MODULE_PINNED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut module = HMODULE::default();
+    unsafe {
+        System::LibraryLoader::GetModuleHandleExW(
+            System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_PIN
+                | System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            PCWSTR(pin_module_in_memory as *const () as *const u16),
+            &mut module,
+        )?;
+    }
+    MODULE_PINNED.store(true, Ordering::Release);
+    debug_log!("pin_module_in_memory: DLL pinned in memory for process lifetime");
+    Ok(())
 }
 /// Initializes and retrieves the thread-local Direct2D and WIC resources.
 /// This function ensures that the heavyweight factory and device objects are created only once per thread.
@@ -243,7 +295,19 @@ fn get_d2d_resources() -> Result<(ID2D1Factory1, ID2D1Device, ID2D1DeviceContext
         // If resources are poisoned or don't exist, recreate them
         if needs_recreation {
             debug_log!("get_d2d_resources: Creating new D2D resources");
-            
+
+            // This thread is about to hold cached graphics state, so make sure the DLL
+            // can never be unmapped while that state exists (see pin_module_in_memory).
+            pin_module_in_memory()?;
+
+            // If poisoned resources exist, release them for real before recreating: we
+            // are on the owning thread in a normal call context (not under the loader
+            // lock), so this is the one place where full teardown is safe.
+            if let Some(old_resources) = resources_ref.take() {
+                debug_log!("get_d2d_resources: Releasing poisoned resources before recreation");
+                drop(ManuallyDrop::into_inner(old_resources));
+            }
+
             // Initialize COM and create all resources
             let com_guard = ComGuard::new()?;
             
@@ -305,14 +369,14 @@ fn get_d2d_resources() -> Result<(ID2D1Factory1, ID2D1Device, ID2D1DeviceContext
             let d2d_context: ID2D1DeviceContext5 = dc.cast()?;
             
             debug_log!("get_d2d_resources: Successfully created all D2D resources");
-            // Store all resources in the unified structure
-            *resources_ref = Some(ThreadResources {
+            // Store all resources in the unified structure (ManuallyDrop: see RESOURCES)
+            *resources_ref = Some(ManuallyDrop::new(ThreadResources {
                 d2d_factory: Some(d2d_factory.clone()),
                 d2d_device: Some(d2d_device.clone()),
                 d2d_context: Some(d2d_context.clone()),
                 poisoned: false,
                 _com_guard: com_guard,
-            });
+            }));
             
             Ok((d2d_factory, d2d_device, d2d_context))
         } else {
@@ -1408,15 +1472,14 @@ const CLSID_SVG_THUMBNAIL_PROVIDER: GUID = GUID::from_u128(0xa884a812_58fd_47d5_
 #[no_mangle]
 #[allow(non_snake_case)]
 extern "system" fn DllMain(hinst_dll: HMODULE, fdw_reason: u32, _lpv_reserved: *const std::ffi::c_void) -> BOOL {
-    ffi_guard!(RESOURCES, BOOL, {
-        if fdw_reason == System::SystemServices::DLL_PROCESS_ATTACH {
-            MODULE_HANDLE.store(hinst_dll.0 as *mut _, Ordering::Release);
-            debug_log!("DllMain: DLL_PROCESS_ATTACH completed. DLL is loaded and initialized.");
-        } else if fdw_reason == System::SystemServices::DLL_PROCESS_DETACH {
-            debug_log!("DllMain: DLL_PROCESS_DETACH received. DLL is unloading.");
-        }
-        true
-    })
+    // DllMain runs under the loader lock, so it must stay minimal: no COM, no
+    // shell calls, no file I/O or logging, nothing that can panic or touch TLS.
+    // Storing the module handle in an atomic is the only work that is both safe
+    // and needed here (DllRegisterServer uses it to resolve the DLL path).
+    if fdw_reason == System::SystemServices::DLL_PROCESS_ATTACH {
+        MODULE_HANDLE.store(hinst_dll.0 as *mut _, Ordering::Release);
+    }
+    true.into()
 }
 
 #[no_mangle]
