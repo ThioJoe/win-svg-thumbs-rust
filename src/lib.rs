@@ -66,8 +66,7 @@ static INIT_REGISTRY: Once = Once::new(); // Track if registry settings were alr
 //                  FFI Panic Safety Macro
 // =================================================================
 
-/// Format a panic payload for debug logging without allocating when logging is off
-/// (caller should only invoke this inside debug_log! / after checking the flag).
+// Format a panic payload for debug logging without allocating when logging is off / (caller should only invoke this inside debug_log! / after checking the flag).
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
@@ -80,22 +79,16 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// What a caught panic should do with the calling thread's cached Direct2D/D3D chain.
 #[derive(Clone, Copy, PartialEq)]
 enum GraphicsCacheOnPanic {
-    /// The entry point renders, so a panic may have interrupted D2D work and left the
-    /// cached device chain in an unknown state. Abandon it.
+    /// The entry point renders, so a panic may have interrupted D2D work and left the cached device chain in an unknown state. Abandon it.
     Discard,
-    /// The entry point never touches Direct2D, so no panic inside it can have corrupted
-    /// the cache. Discarding it here would abandon a whole device chain (permanently -
-    /// see `discard_graphics_cache_after_panic`) for nothing.
+    /// The entry point never touches Direct2D, so no panic inside it can have corrupted / the cache. Discarding it here would abandon a whole device chain
+    /// (permanently - see `discard_graphics_cache_after_panic`) for nothing.
     Keep,
 }
 
-/// Drops this thread's graphics cache out of TLS after a caught panic, when the entry
-/// point that panicked could plausibly have touched it.
-///
-/// The slot is cleared without releasing what was in it: the resources are `ManuallyDrop`,
-/// so this deliberately leaks a device chain (~1.47 MiB and ~24 kernel handles) rather
-/// than tearing down D2D/D3D objects whose state is unknown. That trade is only worth
-/// making when the panic could actually have corrupted them, hence the policy argument.
+///Drops this thread's graphics cache out of TLS after a caught panic, when the entry / point that panicked could plausibly have touched it.
+/// The slot is cleared without releasing what was in it: the resources are `ManuallyDrop`, / so this deliberately leaks a device chain (~1.47 MiB and ~24 kernel handles) rather
+/// than tearing down D2D/D3D objects whose state is unknown. That trade is only worth / making when the panic could actually have corrupted them, hence the policy argument.
 fn discard_graphics_cache_after_panic(policy: GraphicsCacheOnPanic) {
     if policy == GraphicsCacheOnPanic::Discard {
         RESOURCES.with(|resources| {
@@ -106,9 +99,7 @@ fn discard_graphics_cache_after_panic(policy: GraphicsCacheOnPanic) {
     }
 }
 
-/// Macro to wrap FFI functions with panic protection.
-/// This eliminates the boilerplate code for catch_unwind and error handling.
-///
+/// Macro to wrap FFI functions with panic protection. This eliminates the boilerplate code for catch_unwind and error handling.
 /// The first argument is the `GraphicsCacheOnPanic` variant for this entry point:
 /// `Discard` for anything that can reach `get_d2d_resources`, `Keep` for everything else.
 macro_rules! ffi_guard {
@@ -257,27 +248,19 @@ struct ThreadResources {
     _com_guard: ComGuard,
 }
 
-// SAFETY-CRITICAL: The cache is wrapped in ManuallyDrop so that a thread's cached
-// D2D/D3D-WARP chain is never torn down by Rust's TLS destructor machinery. TLS
-// destructors run inside a PE TLS callback during DLL_THREAD_DETACH and
-// DLL_PROCESS_DETACH, i.e. while the OS loader lock is held. Releasing the last
-// reference to a WARP-backed D3D11 device there can deadlock (device teardown waits on
-// its worker threads, which themselves need the loader lock to exit) or crash the host
-// process. Instead:
-//   - Resources are explicitly dropped (ManuallyDrop::into_inner) only when they are
-//     intentionally replaced during normal rendering (device-lost/poisoned path), which
-//     runs on the owning thread outside the loader lock.
-//   - When a thread exits, its cached resources are deliberately leaked (no destructor
-//     is even registered, since the TLS payload no longer needs drop). Threads that
-//     render thumbnails are shell/surrogate pool threads that in practice live until
-//     process exit, so nothing meaningful accumulates.
-//   - After a caught panic, ffi_guard clears the slot without dropping - leaking is the
-//     safest option when the resources are in an unknown state. Only entry points that
-//     can actually reach this cache do so (GraphicsCacheOnPanic::Discard); a panic in,
-//     say, the stream-read loop cannot have touched it, and abandoning a device chain
-//     there would cost ~1.47 MiB and ~24 handles for nothing.
-//   - pin_module_in_memory() below guarantees the DLL (and its d2d1/d3d11/dxgi imports)
-//     is never unmapped while leaked or live caches exist.
+// SAFETY-CRITICAL: The cache is wrapped in ManuallyDrop so that a thread's cached D2D/D3D-WARP chain is never torn down by Rust's TLS destructor machinery.
+// TLS destructors run inside a PE TLS callback during DLL_THREAD_DETACH and DLL_PROCESS_DETACH, i.e. while the OS loader lock is held. 
+// Releasing the last reference to a WARP-backed D3D11 device there can crash host process or deadlock (device teardown waits on its worker threads, which themselves need the loader lock to exit).
+//      
+//  Instead:
+//   - Resources are explicitly dropped (ManuallyDrop::into_inner) only when they are intentionally replaced during normal rendering (device-lost/poisoned path), 
+//          which runs on the owning thread outside the loader lock.
+//   - When a thread exits, its cached resources are deliberately leaked (no destructor is even registered, since the TLS payload no longer needs drop).
+//          Threads that render thumbnails are shell/surrogate pool threads that in practice live until process exit, so nothing meaningful accumulates.
+//   - After a caught panic, ffi_guard clears the slot without dropping - leaking is the safest option when the resources are in an unknown state.
+//          Only entry points that can actually reach this cache do so (GraphicsCacheOnPanic::Discard);
+//          a panic in say the stream-read loop cannot have touched it, and abandoning a device chain there would cost ~1.47 MiB and ~24 handles for nothing.
+//   - pin_module_in_memory() below guarantees the DLL (and its d2d1/d3d11/dxgi imports) is never unmapped while leaked or live caches exist.
 thread_local! {
     static RESOURCES: RefCell<Option<ManuallyDrop<ThreadResources>>> = RefCell::new(None);
 }
@@ -285,18 +268,10 @@ thread_local! {
 // Tracks whether the DLL is already pinned; pinning is idempotent, this only avoids a redundant syscall.
 static MODULE_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Pins this DLL in memory for the lifetime of the process. Called right before the
-/// first per-thread D2D cache is created (a normal call context, never DllMain, so
-/// briefly taking the loader lock inside GetModuleHandleExW is safe).
-///
-/// Why: DllCanUnloadNow only counts live COM objects and server locks, so once the
-/// shell releases its last thumbnail object, COM may FreeLibrary this DLL even though
-/// per-thread caches still own a live D2D-on-WARP device chain. Unmapping the DLL then
-/// pulls d2d1/d3d11/dxgi/d3d10warp out from under that live state - and from under
-/// WARP's running worker threads - which crashes or deadlocks the host (observed as
-/// dllhost.exe crashes during idle periods). Once any thread has cached graphics
-/// state, staying loaded is the only safe option; the surrogate process still exits on
-/// idle, which is when the DLL actually gets released.
+/// Pins this DLL in memory for the lifetime of the process. Called right before the / first per-thread D2D cache is created (a normal call context, never DllMain, so / briefly taking the loader lock inside GetModuleHandleExW is safe).
+/// Why: DllCanUnloadNow only counts live COM objects and server locks, so once the shell releases its last thumbnail object, COM may FreeLibrary this DLL even though per-thread caches still own a live D2D-on-WARP device chain.
+///     Unmapping the DLL then pulls d2d1/d3d11/dxgi/d3d10warp out from under that live state - and from under WARP's running worker threads - which crashes or deadlocks the host (observed as dllhost.exe crashes during idle periods).
+///     Once any thread has cached graphics state, staying loaded is the only safe option; the surrogate process still exits on idle, which is when the DLL actually gets released.
 fn pin_module_in_memory() -> Result<()> {
     if MODULE_PINNED.load(Ordering::Acquire) {
         return Ok(());
@@ -329,13 +304,10 @@ fn get_d2d_resources() -> Result<(ID2D1Factory1, ID2D1Device, ID2D1DeviceContext
         if needs_recreation {
             debug_log!("get_d2d_resources: Creating new D2D resources");
 
-            // This thread is about to hold cached graphics state, so make sure the DLL
-            // can never be unmapped while that state exists (see pin_module_in_memory).
+            // This thread is about to hold cached graphics state, so make sure the DLL can never be unmapped while that state exists (see pin_module_in_memory).
             pin_module_in_memory()?;
 
-            // If poisoned resources exist, release them for real before recreating: we
-            // are on the owning thread in a normal call context (not under the loader
-            // lock), so this is the one place where full teardown is safe.
+            // If poisoned resources exist, release them for real before recreating: we are on the owning thread in a normal call context (not under the loader lock), so this is the one place where full teardown is safe.
             if let Some(old_resources) = resources_ref.take() {
                 debug_log!("get_d2d_resources: Releasing poisoned resources before recreation");
                 drop(ManuallyDrop::into_inner(old_resources));
@@ -691,19 +663,16 @@ fn normalize_css_properties(properties: &str) -> String {
     result
 }
 
-/// The CSS token Direct2D refuses to honour, so it has to come out of both <style>
-/// content and inline style attributes before the document is handed to the renderer.
+// The CSS token Direct2D refuses to honour, so it has to come out of both <style> / content and inline style attributes before the document is handed to the renderer.
 const CSS_IMPORTANT: &str = "!important";
 
 /// Removes every occurrence of `needle` from `haystack`, ignoring ASCII case.
 ///
-/// CSS keywords are case-insensitive, so `!IMPORTANT` has to be stripped exactly like
-/// `!important`, and `str::replace` is case-sensitive. Returns `None` when there is
-/// nothing to remove, so callers skip both the allocation and the DOM write in the common
-/// case where a style carries no `!important` at all.
-///
-/// `needle` must be non-empty ASCII (as `CSS_IMPORTANT` is): every match then begins and
-/// ends on a UTF-8 character boundary, so slicing `haystack` at those offsets is valid.
+/// CSS keywords are case-insensitive, so `!IMPORTANT` has to be stripped exactly like `!important`,
+/// and `str::replace` is case-sensitive. Returns `None` when there is nothing to remove,
+/// so callers skip both the allocation and the DOM write in the common case where a style carries no `!important` at all.
+/// 
+/// `needle` must be non-empty ASCII (as `CSS_IMPORTANT` is): every match then begins and ends on a UTF-8 character boundary, so slicing `haystack` at those offsets is valid.
 fn remove_ignore_ascii_case(haystack: &str, needle: &str) -> Option<String> {
     debug_assert!(needle.is_ascii() && !needle.is_empty());
 
@@ -837,8 +806,7 @@ fn process_svg_styles(svg_data: &[u8]) -> Result<Vec<u8>> {
         let bstr_style = BSTR::from("style");
         let bstr_class = BSTR::from("class");
 
-        // Single-pass approach: traverse the DOM once and use O(1) HashMap lookups
-        // to apply styles, instead of running an XPath query per CSS rule.
+        // Single-pass approach: traverse the DOM once and use O(1) HashMap lookups to apply styles, instead of running an XPath query per CSS rule.
         let all_elements: IXMLDOMNodeList = unsafe { dom.selectNodes(&BSTR::from("//*"))? };
         for i in 0..unsafe { all_elements.length()? } {
             if let Ok(element) = unsafe { all_elements.get_item(i)?.cast::<IXMLDOMElement>() } {
@@ -1043,8 +1011,7 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
         let dest_stride: usize = (requested_width * 4) as usize;
         let source_stride: usize = mapped_rect.pitch as usize;
 
-        // A successful map must provide a valid buffer with enough bytes for
-        // one complete BGRA row before it is used to construct a Rust slice.
+        // A successful map must provide a valid buffer with enough bytes for one complete BGRA row before it is used to construct a Rust slice.
         if mapped_rect.bits.is_null() || source_stride < dest_stride {
             debug_log!(
                 "render_svg_to_hbitmap: Invalid mapped bitmap (pitch={}, required={}, bits_null={})",
@@ -1102,10 +1069,8 @@ pub fn render_svg_to_hbitmap(svg_data: &[u8], requested_width: u32, requested_he
             std::slice::from_raw_parts_mut(dib_data.cast::<u8>(), (requested_width * requested_height * 4) as usize) 
         };
         // Copy pixels from source to dest, un-premultiplying alpha on the CPU.
-        // No pre-initialization needed: the loop below writes every byte of dest_data
-        // (dest stride == width*4, matching the 32-bpp GDI DIB section with no padding).
+        // No pre-initialization needed: the loop below writes every byte of dest_data (dest stride == width*4, matching the 32-bpp GDI DIB section with no padding).
         // This replaces the previous GPU-based D2D UnPremultiply effect.
-
         for y in 0..requested_height as usize {
             let src_start: usize = y * source_stride;
             let dest_start: usize = y * dest_stride;
@@ -1257,11 +1222,9 @@ impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_I
                             break;
                         }
 
-                        // A stream cannot have written more than the buffer it was handed, so a
-                        // larger count is a broken (or hostile) ISequentialStream implementation.
-                        // Trusting it would index past `chunk` and panic; clamping instead would
-                        // append bytes the stream never actually wrote. Neither is acceptable for
-                        // data that is about to be parsed, so reject the stream outright.
+                        // A stream cannot have written more than the buffer it was handed, so a larger count is a broken (or hostile) ISequentialStream implementation.
+                        // Trusting it would index past `chunk` and panic; clamping instead would append bytes the stream never actually wrote. 
+                        // Neither is acceptable for data that is about to be parsed, so reject the stream outright.
                         let bytes_read = bytes_read as usize;
                         if bytes_read > chunk.len() {
                             debug_log!("Initialize: Error - Stream reported {} bytes read into a {}-byte buffer", bytes_read, chunk.len());
@@ -1298,22 +1261,19 @@ impl Shell::PropertiesSystem::IInitializeWithStream_Impl for ThumbnailProvider_I
 impl Shell::IThumbnailProvider_Impl for ThumbnailProvider_Impl {
     #[allow(non_snake_case)]
     fn GetThumbnail(&self, cx: u32, phbmp: *mut Gdi::HBITMAP, pdwalpha: *mut Shell::WTS_ALPHATYPE) -> Result<()> {
-        // The only entry point that renders, so the only one where a caught panic can
-        // have left this thread's cached D2D/D3D chain in an unusable state.
+        // The only entry point that renders, so the only one where a caught panic can have left this thread's cached D2D/D3D chain in an unusable state.
         ffi_guard!(Discard, Result<()>, {
             // log_message(&format!("GetThumbnail: Entered with size: {}x{}", cx, cx));
 			
-			// Both output pointers are dereferenced unconditionally below, so they must be
-            // validated first. The Shell is expected to supply valid pointers, but this is a public
-            // COM vtable entry: any in-process caller can reach it, and dereferencing a null
-            // here would take down the host process instead of returning a clean E_POINTER.
+			// Both output pointers are dereferenced unconditionally below, so they must be validated first. 
+            // The Shell is expected to supply valid pointers, but this is a public COM vtable entry: any in-process caller can reach it, 
+            // and dereferencing a null here would take down the host process instead of returning a clean E_POINTER.
             if phbmp.is_null() || pdwalpha.is_null() {
                 debug_log!("GetThumbnail: Error - Null output pointer (phbmp_null={}, pdwalpha_null={})", phbmp.is_null(), pdwalpha.is_null());
                 return Err(Error::new(E_POINTER, "Null output pointer passed to GetThumbnail"));
             }
 			
-            // Initialize output parameters to safe defaults (COM contract requirement)
-            // pdwalpha is set to UNKNOWN for all failure cases, only changed to ARGB on success
+            // Initialize output parameters to safe defaults (COM contract requirement) pdwalpha is set to UNKNOWN for all failure cases, only changed to ARGB on success
             unsafe {
                 *phbmp = Gdi::HBITMAP(std::ptr::null_mut());
                 *pdwalpha = Shell::WTSAT_UNKNOWN;
@@ -1496,9 +1456,8 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
     #[allow(non_snake_case)]
     fn LockServer(&self, flock: BOOL) -> Result<()> {
         ffi_guard!(Keep, Result<()>, {
-            // Server locks are counted separately from live objects (see SERVER_LOCKS):
-            // a client that unlocks without a matching lock must not be able to consume a
-            // reference that belongs to a living provider.
+            // Server locks are counted separately from live objects (see SERVER_LOCKS): 
+            //      a client that unlocks without a matching lock must not be able to consume a reference that belongs to a living provider.
             if flock.as_bool() {
                 let locks = SERVER_LOCKS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
                 debug_log!("ClassFactory::LockServer: Server locked. Outstanding locks: {}", locks);
@@ -1523,14 +1482,13 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
 static DLL_REFERENCES: AtomicU32 = AtomicU32::new(0);
 // Outstanding IClassFactory::LockServer(TRUE) locks, counted separately from live objects.
 //
-// A client that calls LockServer(FALSE) without a matching lock is violating the COM
-// contract, but folding that unmatched unlock into DLL_REFERENCES would let it consume a
-// reference belonging to a live provider - and then DllCanUnloadNow reports S_OK while
-// that provider is still in use, which entitles COM to FreeLibrary the DLL out from under
-// it. Keeping the two counters apart confines the damage to the lock ledger.
+// A client that calls LockServer(FALSE) without a matching lock is violating the COM contract,
+// but folding that unmatched unlock into DLL_REFERENCES would let it consume a reference belonging to a live provider - 
+// and then DllCanUnloadNow reports S_OK while that provider is still in use, which entitles COM to FreeLibrary the DLL out from under it.
+// Keeping the two counters apart confines the damage to the lock ledger.
 //
-// Signed on purpose: an over-release goes negative rather than being clamped, so a client
-// that unlocks once too often and then locks again ends up balanced instead of leaving a
+// Signed on purpose: an over-release goes negative rather than being clamped, 
+// so a client that unlocks once too often and then locks again ends up balanced instead of leaving a
 // lock outstanding that nothing can ever release. Any balance <= 0 means "no locks held".
 static SERVER_LOCKS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 // A global handle to the DLL module instance - using Option for safer null checking
@@ -1547,9 +1505,7 @@ fn dll_add_ref() {
     debug_log!("DLL reference added. New count: {}", new_count);
 }
 fn dll_release() {
-    // Saturating: the count must never wrap to a huge value, which would keep the DLL
-    // mapped for the life of the process, nor below zero, which would understate the
-    // number of live objects.
+    // Saturating: the count must never wrap to a huge value, which would keep the DLL mapped for the life of the process, nor below zero, which would understate the number of live objects.
     let old_count = DLL_REFERENCES
         .fetch_update(Ordering::Release, Ordering::Relaxed, |count| Some(count.saturating_sub(1)))
         .unwrap_or(0); // The update closure never returns None, so this is always Ok.
@@ -1649,10 +1605,8 @@ const CLSID_SVG_THUMBNAIL_PROVIDER: GUID = GUID::from_u128(0xa884a812_58fd_47d5_
 #[no_mangle]
 #[allow(non_snake_case)]
 extern "system" fn DllMain(hinst_dll: HMODULE, fdw_reason: u32, _lpv_reserved: *const std::ffi::c_void) -> BOOL {
-    // DllMain runs under the loader lock, so it must stay minimal: no COM, no
-    // shell calls, no file I/O or logging, nothing that can panic or touch TLS.
-    // Storing the module handle in an atomic is the only work that is both safe
-    // and needed here (DllRegisterServer uses it to resolve the DLL path).
+    // DllMain runs under the loader lock, so it must stay minimal: no COM, no shell calls, no file I/O or logging, nothing that can panic or touch TLS.
+    // Storing the module handle in an atomic is the only work that is both safe and needed here (DllRegisterServer uses it to resolve the DLL path).
     if fdw_reason == System::SystemServices::DLL_PROCESS_ATTACH {
         MODULE_HANDLE.store(hinst_dll.0 as *mut _, Ordering::Release);
     }
@@ -1862,8 +1816,7 @@ impl RegistryKeyGuard {
         let wide_name = to_pcwstr(name);
         let wide_value = to_pcwstr(value);
 
-        // The size for RegSetValueExW must be in bytes, including the null terminator.
-        // to_pcwstr already adds the null terminator, so wide_value.len() is correct.
+        // The size for RegSetValueExW must be in bytes, including the null terminator. to_pcwstr already adds the null terminator, so wide_value.len() is correct.
         let value_size_bytes = (wide_value.len() * std::mem::size_of::<u16>()) as u32;
 
         unsafe {
