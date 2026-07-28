@@ -100,8 +100,7 @@ fn discard_graphics_cache_after_panic(policy: GraphicsCacheOnPanic) {
 }
 
 /// Macro to wrap FFI functions with panic protection. This eliminates the boilerplate code for catch_unwind and error handling.
-/// The first argument is the `GraphicsCacheOnPanic` variant for this entry point:
-/// `Discard` for anything that can reach `get_d2d_resources`, `Keep` for everything else.
+// / The first argument is the `GraphicsCacheOnPanic` variant for this entry point: `Discard` for anything that can reach `get_d2d_resources`, `Keep` for everything else.
 macro_rules! ffi_guard {
     // For functions that return Result<T>
     ($cache_policy:ident, Result<$ret_type:ty>, $body:expr) => {{
@@ -1462,11 +1461,14 @@ impl Com::IClassFactory_Impl for ClassFactory_Impl {
                 let locks = SERVER_LOCKS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
                 debug_log!("ClassFactory::LockServer: Server locked. Outstanding locks: {}", locks);
             } else {
-                let locks = SERVER_LOCKS.fetch_sub(1, Ordering::Release).saturating_sub(1);
-                if locks < 0 {
-                    debug_log!("ClassFactory::LockServer: Unmatched unlock, lock balance now {}", locks);
+                // Saturating: an unmatched unlock is dropped, never banked as a debt that would silently cancel the next legitimate lock.
+                let previous = SERVER_LOCKS
+                    .fetch_update(Ordering::Release, Ordering::Relaxed, |locks| Some(locks.saturating_sub(1)))
+                    .unwrap_or(0); // The update closure never returns None, so this is always Ok.
+                if previous == 0 {
+                    debug_log!("ClassFactory::LockServer: Ignoring unmatched unlock, no locks were outstanding");
                 } else {
-                    debug_log!("ClassFactory::LockServer: Server unlocked. Outstanding locks: {}", locks);
+                    debug_log!("ClassFactory::LockServer: Server unlocked. Outstanding locks: {}", previous - 1);
                 }
             }
             Ok(())
@@ -1487,10 +1489,11 @@ static DLL_REFERENCES: AtomicU32 = AtomicU32::new(0);
 // and then DllCanUnloadNow reports S_OK while that provider is still in use, which entitles COM to FreeLibrary the DLL out from under it.
 // Keeping the two counters apart confines the damage to the lock ledger.
 //
-// Signed on purpose: an over-release goes negative rather than being clamped, 
-// so a client that unlocks once too often and then locks again ends up balanced instead of leaving a
-// lock outstanding that nothing can ever release. Any balance <= 0 means "no locks held".
-static SERVER_LOCKS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+// Unsigned, and the decrement saturates, so an unmatched unlock is dropped rather than banked as a debt.
+// The counter is process-global, so no accounting here can fully protect one client's lock from another client's bug - but the two failure directions are not equal. 
+// Banking the debt would let the next legitimate lock merely pay it off, unpinning the DLL while a client is still relying on that lock;
+// dropping it can at worst leave a lock outstanding that nothing releases, which costs a mapped module in a surrogate that exits on idle anyway. Fail toward staying loaded.
+static SERVER_LOCKS: AtomicU32 = AtomicU32::new(0);
 // A global handle to the DLL module instance - using Option for safer null checking
 static MODULE_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 // Global flag for hardware acceleration preference (defaults to false = WARP)
@@ -1667,7 +1670,7 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
         let ref_count = DLL_REFERENCES.load(Ordering::Acquire);
         let lock_count = SERVER_LOCKS.load(Ordering::Acquire);
 
-        if ref_count == 0 && lock_count <= 0 {
+        if ref_count == 0 && lock_count == 0 {
             debug_log!("DllCanUnloadNow: Returning S_OK - DLL can be unloaded");
             S_OK
         } else {

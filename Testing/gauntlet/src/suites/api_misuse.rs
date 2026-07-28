@@ -512,9 +512,8 @@ fn lock_server_contract(dll_handle: &Dll, report: &mut Report) {
     );
 
     report.begin_case("unbalanced_unlock_does_not_report_unloadable");
-    // An over-released server lock underflows the DLL's reference counter.
-    // Wrapping to a huge value is the safe direction (unload stays blocked);
-    // reporting S_OK while objects are alive would be catastrophic, because COM
+    // An over-released server lock must never reach the live-object counter.
+    // Reporting S_OK while objects are alive would be catastrophic, because COM
     // would unmap the DLL under a live provider.
     let (Ok(factory), Ok(provider)) = (dll_handle.class_factory(), dll_handle.create_provider())
     else {
@@ -532,8 +531,10 @@ fn lock_server_contract(dll_handle: &Dll, report: &mut Report) {
             hr.0 as u32
         ),
     );
-    // Re-balance so the count returns to a sane value for later suites.
-    let _ = unsafe { factory.LockServer(true) };
+    // Nothing to re-balance: the unmatched unlock is dropped rather than banked, so
+    // the ledger is already where it started. A LockServer(TRUE) here would not undo
+    // anything - it would strand a lock nothing ever releases, and every later
+    // "unload allowed once everything is released" check would fail on it.
     drop(provider);
     drop(factory);
 }
@@ -578,10 +579,9 @@ fn unbalanced_unlock_reference_count(dll_handle: &Dll, report: &mut Report) {
         ),
     );
 
-    // Restore the count so nothing downstream inherits the damage.
-    if let Ok(f) = dll_handle.class_factory() {
-        let _ = unsafe { f.LockServer(true) };
-    }
+    // Nothing to restore: the unmatched unlock leaves neither the object count nor
+    // the lock ledger inconsistent, so a compensating LockServer(TRUE) would only
+    // strand a lock for server_lock_ledger to clean up.
     drop(survivor);
 }
 

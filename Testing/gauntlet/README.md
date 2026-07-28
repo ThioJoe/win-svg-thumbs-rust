@@ -140,19 +140,21 @@ complete picture in one go, not just the first thing that broke.
 
 ## Findings
 
-The three defects the gauntlet originally found are fixed on master. One concern
-introduced by the second fix is still open and is guarded by a check that
-currently fails:
+The three defects the gauntlet originally found are fixed on master, and each one
+left its check behind as a regression test. Nothing is currently expected to
+fail — any red check is a real one.
 
 | Check | State |
 |---|---|
 | `stream-faults/over_reported_read_leaks_thread_graphics_cache` | fixed (`7d23b55`) |
 | `api-misuse/unbalanced_unlock_corrupts_reference_count` | fixed (`1255927`) |
 | `render/css_important_{uppercase,mixedcase}_is_stripped` | fixed (`965d473`) |
-| `api-misuse/server_lock_alone_blocks_unload` | passes — new regression test for the now-separate lock counter |
-| `api-misuse/unmatched_unlock_does_not_cancel_a_later_lock` | **fails** — the lock ledger is signed, so one client's over-release cancels another's lock |
+| `api-misuse/server_lock_alone_blocks_unload` | passes — regression test for the now-separate lock counter |
+| `api-misuse/unmatched_unlock_does_not_cancel_a_later_lock` | passes — the lock ledger saturates at zero, so an over-release cannot cancel another client's lock |
 
-**See [FINDINGS.md](FINDINGS.md)** for the full write-up: what each fix does, how
-it was verified, the open concern with the signed lock ledger, and the
-constraints a fix in this area must not break (the `ManuallyDrop` TLS cache and
-the module pin are the v1.11.0 crash fix and are load-bearing).
+Two constraints anything touching this area has to respect, because they are the
+v1.11.0 crash fix rather than incidental design: the `ManuallyDrop` TLS graphics
+cache is never dropped on thread exit (TLS destructors run under the loader lock,
+where releasing a WARP-backed D3D11 device deadlocks or crashes the host), and
+`pin_module_in_memory` keeps the DLL mapped while any leaked or live cache
+exists. `unload-crash-repro.yml` is the regression test for both.
