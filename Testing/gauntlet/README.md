@@ -138,17 +138,21 @@ every suite runs regardless of what the previous one did, and the results are
 accumulated; the non-zero exit happens at the end. So a red run gives you the
 complete picture in one go, not just the first thing that broke.
 
-## Open findings (these currently fail the build)
+## Findings
 
-Three defects, all demonstrated by named checks and none of them fixed:
+The three defects the gauntlet originally found are fixed on master. One concern
+introduced by the second fix is still open and is guarded by a check that
+currently fails:
 
-| Check | Defect |
+| Check | State |
 |---|---|
-| `stream-faults/over_reported_read_leaks_thread_graphics_cache` | `Initialize` trusts the byte count an `IStream` reports, so an over-reporting stream panics the read loop; `ffi_guard`'s recovery then abandons the thread's D2D device chain (~28 handles per occurrence) |
-| `api-misuse/unbalanced_unlock_corrupts_reference_count` | `LockServer(FALSE)` decrements `DLL_REFERENCES` without a floor, so an unmatched unlock lets `DllCanUnloadNow` return `S_OK` while providers are live |
-| `render/css_important_{uppercase,mixedcase}_is_stripped` | `!important` is detected case-insensitively but stripped case-sensitively, so `!IMPORTANT` survives into the document and Direct2D drops the declaration |
+| `stream-faults/over_reported_read_leaks_thread_graphics_cache` | fixed (`7d23b55`) |
+| `api-misuse/unbalanced_unlock_corrupts_reference_count` | fixed (`1255927`) |
+| `render/css_important_{uppercase,mixedcase}_is_stripped` | fixed (`965d473`) |
+| `api-misuse/server_lock_alone_blocks_unload` | passes — new regression test for the now-separate lock counter |
+| `api-misuse/unmatched_unlock_does_not_cancel_a_later_lock` | **fails** — the lock ledger is signed, so one client's over-release cancels another's lock |
 
-**See [FINDINGS.md](FINDINGS.md)** for the full write-up: exact line references,
-how each was found, measured costs, suggested fixes, and the constraints a fix
-must not break (in particular, the `ManuallyDrop` TLS cache and the module pin
-are the v1.11.0 crash fix and must stay).
+**See [FINDINGS.md](FINDINGS.md)** for the full write-up: what each fix does, how
+it was verified, the open concern with the signed lock ledger, and the
+constraints a fix in this area must not break (the `ManuallyDrop` TLS cache and
+the module pin are the v1.11.0 crash fix and are load-bearing).

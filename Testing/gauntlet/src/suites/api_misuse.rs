@@ -31,8 +31,9 @@ pub fn run(dll_handle: &Dll, report: &mut Report) {
     lock_server_contract(dll_handle, report);
     release_ordering(dll_handle, report);
     size_boundaries(dll_handle, report);
-    // Last: this one deliberately leaves the DLL's reference count inconsistent.
+    // Last: these deliberately leave the DLL's lock ledger inconsistent.
     unbalanced_unlock_reference_count(dll_handle, report);
+    server_lock_ledger(dll_handle, report);
 }
 
 // ---------------------------------------------------------------
@@ -700,4 +701,102 @@ fn size_boundaries(dll_handle: &Dll, report: &mut Report) {
         };
         report.check(name, ok, detail);
     }
+}
+
+// ---------------------------------------------------------------
+//                     Server lock ledger
+// ---------------------------------------------------------------
+
+/// Properties of the server-lock counter that became load-bearing when locks
+/// stopped sharing the live-object counter.
+///
+/// While `LockServer(TRUE)` incremented the same counter as live objects, "a
+/// lock keeps the DLL loaded" was covered for free by the object count. Now that
+/// the two are separate, it is a distinct property with nothing else testing it,
+/// and the interaction between an over-release and a later legitimate lock is a
+/// new behaviour that did not exist before.
+fn server_lock_ledger(dll_handle: &Dll, report: &mut Report) {
+    /// Drives the lock ledger back to "no locks held" so a later check starts
+    /// from a known state. Bounded, because the whole point of these checks is
+    /// that the counter may not be where we think it is.
+    fn rebalance(dll_handle: &Dll) {
+        for _ in 0..8 {
+            if dll_handle.unload_allowed() {
+                return;
+            }
+            match dll_handle.class_factory() {
+                Ok(f) => {
+                    let _ = unsafe { f.LockServer(false) };
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    // ---- A lock on its own must block unload. ----
+    report.begin_case("server_lock_alone_blocks_unload");
+    match dll_handle.class_factory() {
+        Ok(factory) => {
+            let locked = unsafe { factory.LockServer(true) }.is_ok();
+            // Release the factory, so the only thing left holding the DLL is the
+            // lock itself. Before locks had their own counter this was
+            // indistinguishable from the factory's own reference.
+            drop(factory);
+            let hr = dll_handle.can_unload();
+            report.check(
+                "server_lock_alone_blocks_unload",
+                locked && hr != S_OK,
+                format!(
+                    "LockServer(TRUE)={locked}, then every object released: \
+                     DllCanUnloadNow=0x{:08X}. A server lock must keep the DLL loaded on its \
+                     own - COM may unmap it the moment this reports S_OK.",
+                    hr.0 as u32
+                ),
+            );
+            // Balance our own lock before moving on.
+            if let Ok(f) = dll_handle.class_factory() {
+                let _ = unsafe { f.LockServer(false) };
+            }
+        }
+        Err(e) => report.fail("server_lock_alone_blocks_unload", format!("no class factory: {e:?}")),
+    }
+    rebalance(dll_handle);
+
+    // ---- One client's over-release must not cancel another's lock. ----
+    report.begin_case("unmatched_unlock_does_not_cancel_a_later_lock");
+    // LockServer is process-global: every client shares one ledger. So the
+    // question is not just "can a client corrupt its own accounting" but "can a
+    // buggy client silently revoke a lock that a *different*, correct client is
+    // relying on".
+    //
+    // Client A over-releases.
+    if let Ok(a) = dll_handle.class_factory() {
+        let _ = unsafe { a.LockServer(false) };
+        drop(a);
+    }
+    // Client B then takes a lock it is entitled to, and releases its factory.
+    let b_locked = match dll_handle.class_factory() {
+        Ok(b) => {
+            let ok = unsafe { b.LockServer(true) }.is_ok();
+            drop(b);
+            ok
+        }
+        Err(_) => false,
+    };
+    let hr = dll_handle.can_unload();
+    report.check(
+        "unmatched_unlock_does_not_cancel_a_later_lock",
+        b_locked && hr != S_OK,
+        format!(
+            "after an unmatched LockServer(FALSE) from one client, a second client's \
+             LockServer(TRUE)={b_locked} left DllCanUnloadNow=0x{:08X}. The lock ledger is \
+             process-global, so a signed counter that goes negative on an over-release lets one \
+             buggy client silently consume a lock that a correct client is holding: the -1 and \
+             the +1 cancel, the ledger reads 0, and COM may unload the DLL while client B still \
+             believes it is locked. Saturating the decrement at zero avoids this - its worst \
+             case is a DLL that stays mapped, which for an idle-exiting surrogate is harmless.",
+            hr.0 as u32
+        ),
+    );
+    rebalance(dll_handle);
 }
